@@ -131,7 +131,7 @@ app.get('/', (req, res) => {
   const parsed = new URL(instanceUrl);
   const options = {
     hostname: parsed.hostname,
-    path: parsed.pathname + '/api/v1/applications',
+    path: parsed.pathname.replace(/\/$/, '') + '/api/v1/applications',
     method: 'GET',
     headers: {
       Authorization: `Bearer ${token}`,
@@ -171,7 +171,7 @@ app.get('/', (req, res) => {
             redirectRes.on('data', chunk => (rdata += chunk));
             redirectRes.on('end', () => {
               // ------- sanity check for redirected payload -------
-              if (!rdata.trim() || !rdata.startsWith('{')) {
+              if (!rdata.trim() || (!rdata.trim().startsWith('{') && !rdata.trim().startsWith('['))) {
                 console.warn(
                   'Redirect response does not look like JSON, first 200 chars:',
                   rdata.slice(0, 200)
@@ -243,7 +243,7 @@ app.get('/', (req, res) => {
       if (!data.trim()) {
         return res.status(500).send('Coolify API returned an empty response');
       }
-      if (!data.startsWith('{')) {
+      if (!data.trim().startsWith('{') && !data.trim().startsWith('[')) {
         console.warn(
           'Coolify API response does not start with “{”, first 200 chars:',
           data.slice(0, 200)
