@@ -2,6 +2,12 @@
 
 `custom_links.json` is merged with the applications and services discovered from the Coolify API.
 
+## File location
+
+- **Local development:** `./custom_links.json`, next to `server.js`.
+- **Docker Compose:** the project directory is mounted at `/app/data`, so the server reads `/app/data/custom_links.json`. Edit `custom_links.json` on the host and the container sees the change.
+- **Override:** set `DATA_DIR` to read the file from a different directory. It defaults to `/app/data` when `NODE_ENV=production`, otherwise to the project directory.
+
 ## Matching
 
 An entry matches an automated card when the hostname in `domain` matches the card's hostname.

@@ -9,7 +9,8 @@ services:
     env_file:
       - .env
     volumes:
-      - ./custom_links.json:/app/custom_links.json:ro
+      - ./:/app/data
     environment:
       - NODE_ENV=production
+      - DATA_DIR=/app/data
     restart: unless-stopped

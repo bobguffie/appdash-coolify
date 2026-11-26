@@ -18,7 +18,7 @@ RUN npm install --omit=dev
 # 2. Copy the application source and default manual-link overrides
 # ---------------------------------------------------------------------------
 COPY server.js ./
-COPY custom_links.json ./
+COPY custom_links.json ./data/
 
 # ---------------------------------------------------------------------------
 # 3. Runtime configuration

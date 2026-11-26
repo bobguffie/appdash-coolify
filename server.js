@@ -249,14 +249,20 @@ function customIconHtml(item) {
   }
   return '<span class="emoji" aria-hidden="true">' + esc(icon) + '</span>';
 }
+function customLinksPath() {
+  const dataDir = process.env.DATA_DIR
+    || (process.env.NODE_ENV === 'production' ? '/app/data' : __dirname);
+  return path.join(dataDir, 'custom_links.json');
+}
+
 function loadCustomLinks() {
-  const filePath = path.join(__dirname, 'custom_links.json');
+  const filePath = customLinksPath();
   let parsed;
   try {
     parsed = JSON.parse(fs.readFileSync(filePath, 'utf8'));
   } catch (err) {
     if (err.code !== 'ENOENT') {
-      console.warn('Could not read custom_links.json: ' + err.message);
+      console.warn('Could not read ' + filePath + ': ' + err.message);
     }
     return [];
   }
@@ -659,6 +665,7 @@ module.exports = {
   asArray,
   cardHtml,
   customIconHtml,
+  customLinksPath,
   dedupeItems,
   displayName,
   domainKey,
