@@ -1,5 +1,3 @@
-version: "3.9"
-
 services:
   app:
     build:
@@ -8,6 +6,10 @@ services:
     container_name: coolify-web-directory
     ports:
       - "3000:3000"
+    env_file:
+      - .env
+    volumes:
+      - ./custom_links.json:/app/custom_links.json:ro
     environment:
       - NODE_ENV=production
     restart: unless-stopped

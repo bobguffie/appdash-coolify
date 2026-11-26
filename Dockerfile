@@ -15,21 +15,16 @@ COPY package*.json ./
 RUN npm install --omit=dev
 
 # ---------------------------------------------------------------------------
-# 2. Copy the application source and the .env credentials
+# 2. Copy the application source and default manual-link overrides
 # ---------------------------------------------------------------------------
-# Copy the server code
 COPY server.js ./
-# Copy the .env file that holds COOLIFY_INSTANCE_URL and COOLIFY_API_TOKEN
-COPY .env ./
+COPY custom_links.json ./
 
 # ---------------------------------------------------------------------------
 # 3. Runtime configuration
 # ---------------------------------------------------------------------------
-# The Express app listens on this port
+# Credentials are injected at runtime (COOLIFY_INSTANCE_URL / COOLIFY_API_TOKEN).
+# Do not bake .env into the image.
 EXPOSE 3000
-
-# Use production mode
 ENV NODE_ENV=production
-
-# Start the server
 CMD ["node", "server.js"]

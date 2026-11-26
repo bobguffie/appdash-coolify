@@ -1,12 +1,16 @@
 /**
  * Coolify Web Directory
- * Single-file Express dashboard for the apps running on a Coolify instance.
+ * Single-file Express dashboard for applications, services, and manual links
+ * running on a Coolify instance.
  */
 
 require('dotenv').config();
 
 const express = require('express');
+const http = require('http');
 const https = require('https');
+const fs = require('fs');
+const path = require('path');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -28,6 +32,135 @@ function esc(v) {
   }[c]));
 }
 
+function asArray(payload) {
+  if (Array.isArray(payload)) return payload;
+  if (payload && Array.isArray(payload.data)) return payload.data;
+  return [];
+}
+
+function looksLikeDomain(value) {
+  if (typeof value !== 'string') return false;
+  const trimmed = value.trim();
+  if (!trimmed || /\s/.test(trimmed)) return false;
+  return /^(https?:\/\/)?[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+(?::\d+)?(?:\/.*)?$/i.test(trimmed);
+}
+
+function normalizeUrl(value) {
+  const raw = String(value == null ? '' : value).trim();
+  if (!raw) return '';
+  let url = raw;
+  if (!/^https?:\/\//i.test(url)) {
+    url = `https://${url.replace(/^\/+/, '')}`;
+  }
+  return url.replace(/\/+$/, '');
+}
+
+function domainKey(value) {
+  const raw = String(value == null ? '' : value).trim();
+  if (!raw) return '';
+  try {
+    return new URL(normalizeUrl(raw)).hostname.replace(/^www\./i, '').toLowerCase();
+  } catch {
+    return raw
+      .replace(/^https?:\/\//i, '')
+      .replace(/^www\./i, '')
+      .split(/[/?#]/)[0]
+      .toLowerCase();
+  }
+}
+
+function extractDomains(value, label, output = []) {
+  if (value == null || value === '') return output;
+
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (!trimmed) return output;
+
+    if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+      try {
+        return extractDomains(JSON.parse(trimmed), label, output);
+      } catch {
+        // Fall through and treat it as a plain string.
+      }
+    }
+
+    for (const part of trimmed.split(/[\n,]+/)) {
+      const candidate = part.trim();
+      if (candidate && looksLikeDomain(candidate)) {
+        output.push({ domain: candidate, service: label });
+      }
+    }
+    return output;
+  }
+
+  if (Array.isArray(value)) {
+    for (const entry of value) extractDomains(entry, label, output);
+    return output;
+  }
+
+  if (typeof value === 'object') {
+    const explicit = value.domain || value.fqdn || value.url;
+    const explicitLabel = value.name || value.service || value.container || label;
+    if (explicit) extractDomains(explicit, explicitLabel, output);
+
+    for (const [key, entry] of Object.entries(value)) {
+      if (['domain', 'fqdn', 'url', 'name', 'service', 'container'].includes(key)) continue;
+
+      if (typeof entry === 'string' && looksLikeDomain(entry)) {
+        output.push({ domain: entry, service: key || label });
+      } else {
+        extractDomains(entry, key || label, output);
+      }
+    }
+  }
+
+  return output;
+}
+function normalizeCoolifyItem(raw, source) {
+  if (!raw || typeof raw !== 'object') return [];
+
+  const name = String(raw.name || raw.uuid || 'Unnamed').trim() || 'Unnamed';
+  const status = String(raw.status || 'unknown').trim() || 'unknown';
+  const domains = [];
+
+  // Compose-specific domains first so service labels are preserved.
+  extractDomains(raw.docker_compose_domains, name, domains);
+  extractDomains(raw.fqdn, name, domains);
+  extractDomains(raw.domains, name, domains);
+
+  const seen = new Set();
+  return domains
+    .filter(entry => entry && entry.domain)
+    .map(entry => {
+      const url = normalizeUrl(entry.domain);
+      const key = domainKey(url);
+      if (!key || seen.has(key)) return null;
+      seen.add(key);
+
+      const service = entry.service && entry.service !== name ? entry.service : '';
+      return {
+        name: service ? `${name} · ${service}` : name,
+        url,
+        status,
+        source,
+        icon: null,
+        custom: false,
+        manualName: false,
+      };
+    })
+    .filter(Boolean);
+}
+
+function dedupeItems(items) {
+  const seen = new Set();
+  return items.filter(item => {
+    const key = domainKey(item.url);
+    if (!key || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
 /** "bin-reminder-skdc:main-txk1guz40kmbc4o1ds32taqx" -> "Bin Reminder Skdc" */
 function cleanName(raw) {
   const head = String(raw || 'Unnamed').split(':')[0];
@@ -45,16 +178,42 @@ const NAME_OVERRIDES = {
 /** Names Coolify generates that say nothing about the app. */
 const GENERIC_NAME = /^(dockerfile|dockerimage|application|app|service|container|unnamed)$/i;
 
+const ACRONYMS = { uk: 'UK', api: 'API', db: 'DB', ai: 'AI', ui: 'UI', seo: 'SEO', cdn: 'CDN', http: 'HTTP', https: 'HTTPS' };
+
+function titleCaseWords(value) {
+  return String(value || '').split(/\s+/).map(word => {
+    const key = word.toLowerCase();
+    return ACRONYMS[key] || word.charAt(0).toUpperCase() + word.slice(1);
+  }).join(' ');
+}
+
 /** Prefer an explicit or hostname-derived name when Coolify's own name is unhelpful. */
-function displayName(a) {
-  const host = primaryHost(a.fqdn);
+function displayName(item) {
+  if (item.manualName) return item.name;
+
+  const host = domainKey(item.url);
   if (NAME_OVERRIDES[host]) return NAME_OVERRIDES[host];
 
-  const cleaned = cleanName(a.name);
+  const cleaned = titleCaseWords(cleanName(item.name));
   if (!GENERIC_NAME.test(cleaned)) return cleaned;
 
   const label = host.split('.')[0] || '';
-  return label.replace(/\b\w/g, c => c.toUpperCase()) || cleaned;
+  if (label && !LONG_TOKEN.test(label) && label !== 'www') {
+    return titleCaseWords(label);
+  }
+  return cleaned;
+}
+
+function statusInfo(status) {
+  const s = String(status || '').toLowerCase();
+  if (s === 'manual' || s === 'linked') return { label: 'Manual', tone: 'manual' };
+  if (s.includes('unhealthy')) return { label: 'Unhealthy', tone: 'bad' };
+  if (s.includes('healthy')) return { label: 'Healthy', tone: 'ok' };
+  if (s.includes('running')) return { label: 'Running', tone: 'ok' };
+  if (s.includes('restart')) return { label: 'Restarting', tone: 'warn' };
+  if (s.includes('exited') || s.includes('stopped') || s.includes('dead')) return { label: 'Stopped', tone: 'bad' };
+  if (!s) return { label: 'Unknown', tone: 'warn' };
+  return { label: s.replace(/[:_]+/g, ' · '), tone: 'warn' };
 }
 
 function initials(name) {
@@ -62,45 +221,6 @@ function initials(name) {
   if (!w.length) return '?';
   if (w.length === 1) return w[0].slice(0, 2).toUpperCase();
   return (w[0][0] + w[1][0]).toUpperCase();
-}
-
-/**
- * Coolify can list several hostnames per app, including an internal UUID-style one.
- * Pick the friendliest: skip uuid subdomains and "www", prefer the shortest.
- */
-function firstFqdn(fqdn) {
-  const list = String(fqdn || '').split(',').map(s => s.trim()).filter(Boolean);
-  if (!list.length) return '';
-
-  const score = (u) => {
-    const host = u.replace(/^https?:\/\//i, '').replace(/\/+$/, '');
-    const label = host.split('.')[0].toLowerCase();
-    let s = host.length * 0.01;
-    if (LONG_TOKEN.test(label)) s += 100;
-    if (label === 'www') s += 50;
-    return s;
-  };
-
-  return list.slice().sort((a, b) => score(a) - score(b))[0];
-}
-
-function primaryHost(fqdn) {
-  return firstFqdn(fqdn).replace(/^https?:\/\//i, '').replace(/\/+$/, '');
-}
-
-function fullUrl(fqdn) {
-  const f = firstFqdn(fqdn);
-  return /^https?:\/\//i.test(f) ? f : 'https://' + f;
-}
-
-function statusInfo(status) {
-  const s = String(status || '').toLowerCase();
-  if (s.includes('healthy')) return { label: 'Healthy', tone: 'ok' };
-  if (s.includes('running')) return { label: 'Running', tone: 'ok' };
-  if (s.includes('restart')) return { label: 'Restarting', tone: 'warn' };
-  if (s.includes('exited') || s.includes('stopped') || s.includes('dead')) return { label: 'Stopped', tone: 'bad' };
-  if (!s) return { label: 'Unknown', tone: 'warn' };
-  return { label: s.replace(/[:_]+/g, ' \u00b7 '), tone: 'warn' };
 }
 
 function gradientFor(name) {
@@ -111,8 +231,9 @@ function gradientFor(name) {
 }
 
 /** Candidate logo URLs for an app, tried in order, all from the app's own origin. */
-function logoSources(fqdn) {
-  const origin = fullUrl(fqdn).replace(/\/+$/, '');
+function logoSources(item) {
+  if (item.icon) return '';
+  const origin = normalizeUrl(item.url).replace(/\/+$/, '');
   return [
     origin + '/apple-touch-icon.png',
     origin + '/apple-touch-icon-precomposed.png',
@@ -120,34 +241,110 @@ function logoSources(fqdn) {
   ].join('|');
 }
 
-function cardHtml(a) {
-  const name = displayName(a);
-  const host = primaryHost(a.fqdn);
-  const url = fullUrl(a.fqdn);
-  const st = statusInfo(a.status);
-  const hay = (name + ' ' + host).toLowerCase();
+function customIconHtml(item) {
+  const icon = item.icon == null ? '' : String(item.icon).trim();
+  if (!icon) return '';
+  if (/^(https?:\/\/|data:image\/)/i.test(icon)) {
+    return '<img class="custom-icon" src="' + esc(icon) + '" alt="" referrerpolicy="no-referrer" loading="lazy">';
+  }
+  return '<span class="emoji" aria-hidden="true">' + esc(icon) + '</span>';
+}
+function loadCustomLinks() {
+  const filePath = path.join(__dirname, 'custom_links.json');
+  let parsed;
+  try {
+    parsed = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+  } catch (err) {
+    if (err.code !== 'ENOENT') {
+      console.warn('Could not read custom_links.json: ' + err.message);
+    }
+    return [];
+  }
 
-  return '<a class="card" href="' + esc(url) + '" target="_blank" rel="noopener"'
-    + ' data-hay="' + esc(hay) + '" title="' + esc(host) + '">'
-    + '<span class="avatar" style="background:' + gradientFor(name) + '">'
-    + '<span class="inits">' + esc(initials(name)) + '</span>'
-    + '<img class="logo" alt="" referrerpolicy="no-referrer" data-srcs="' + esc(logoSources(a.fqdn)) + '">'
-    + '</span>'
-    + '<span class="body">'
-    + '<span class="name">' + esc(name) + '</span>'
-    + '<span class="host">' + esc(host) + '</span>'
-    + '</span>'
-    + '<span class="tail">'
-    + '<span class="pill ' + st.tone + '"><span class="dot"></span>' + esc(st.label) + '</span>'
-    + '<svg class="arrow" viewBox="0 0 16 16" fill="none" aria-hidden="true">'
-    + '<path d="M6 3h7v7M13 3 4.5 11.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>'
-    + '</svg>'
-    + '</span>'
-    + '</a>';
+  let entries = [];
+  if (Array.isArray(parsed)) {
+    entries = parsed;
+  } else if (parsed && Array.isArray(parsed.links)) {
+    entries = parsed.links;
+  } else if (parsed && typeof parsed.links === 'object' && parsed.links !== null) {
+    entries = Object.entries(parsed.links).map(([domain, value]) => {
+      if (typeof value === 'string') return { domain, name: value };
+      return { domain, ...(value || {}) };
+    });
+  } else if (parsed && typeof parsed === 'object' && (parsed.domain || parsed.url || parsed.link)) {
+    entries = [parsed];
+  } else if (parsed && typeof parsed === 'object') {
+    entries = Object.entries(parsed).map(([domain, value]) => {
+      if (typeof value === 'string') return { domain, name: value };
+      return { domain, ...(value || {}) };
+    });
+  }
+
+  return entries
+    .map(entry => {
+      if (!entry || typeof entry !== 'object') return null;
+
+      const domain = String(entry.domain || entry.host || entry.link || entry.url || '').trim();
+      const providedUrl = entry.url || entry.link;
+      const providedName = entry.name || entry.title;
+      const url = normalizeUrl(providedUrl || domain);
+      const name = String(providedName || domain || url).trim();
+      const iconValue = entry.icon ?? entry.logo ?? entry.emoji ?? null;
+      const icon = iconValue == null ? null : String(iconValue).trim();
+
+      if (!url) return null;
+      return {
+        domain: domain || url,
+        url,
+        name: name || url,
+        icon,
+        hasUrl: Boolean(providedUrl),
+        hasName: Boolean(providedName),
+      };
+    })
+    .filter(Boolean);
 }
 
+function mergeItems(automated, custom) {
+  const merged = new Map();
+
+  for (const item of automated) {
+    const key = domainKey(item.url);
+    if (key && !merged.has(key)) {
+      merged.set(key, { ...item });
+    }
+  }
+
+  for (const entry of custom) {
+    const matchKey = domainKey(entry.domain || entry.url);
+    if (!matchKey) continue;
+
+    if (merged.has(matchKey)) {
+      const existing = merged.get(matchKey);
+      if (entry.hasName && entry.name) {
+        existing.name = entry.name;
+        existing.manualName = true;
+      }
+      if (entry.hasUrl && entry.url) existing.url = entry.url;
+      if (entry.icon != null && entry.icon !== '') existing.icon = entry.icon;
+      existing.custom = true;
+    } else {
+      merged.set(matchKey, {
+        name: entry.name || entry.domain || entry.url,
+        url: entry.url,
+        status: 'manual',
+        source: 'custom',
+        icon: entry.icon,
+        custom: true,
+        manualName: true,
+      });
+    }
+  }
+
+  return [...merged.values()];
+}
 const STYLE = `
-  *,*::before,*::after{box-sizing:border-box}
+*,*::before,*::after{box-sizing:border-box}
   :root{
     --bg:#07090f; --card:#11141d; --card-hover:#161a26;
     --line:rgba(255,255,255,.07); --line-hi:rgba(129,140,248,.42);
@@ -248,30 +445,69 @@ const STYLE = `
     .pill{display:none}
   }
   @media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+  .notice{grid-column:1/-1;display:flex;flex-wrap:wrap;gap:8px;align-items:baseline;padding:14px 16px;border-radius:12px;border:1px solid rgba(251,191,36,.25);background:rgba(251,191,36,.08);color:#fde68a;font-size:13px}
+  .notice strong{font-weight:650;color:#fef3c7}
+  .pill.manual{color:#60a5fa;background:rgba(96,165,250,.11);box-shadow:inset 0 0 0 1px rgba(96,165,250,.22)}
+  .name-row{display:flex;align-items:center;gap:8px;min-width:0}
+  .name-row .name{min-width:0}
+  .manual-badge{flex:none;font-size:9.5px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:#93c5fd;background:rgba(59,130,246,.14);box-shadow:inset 0 0 0 1px rgba(59,130,246,.25);padding:3px 6px;border-radius:5px}
+  .avatar .custom-icon{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;padding:10px;background:transparent}
+  .avatar .emoji{font-size:34px;line-height:1;position:relative;z-index:1}
 `;
 
-function page(cards, count, error) {
-  const body = error
-    ? '<div class="empty"><strong>Could not reach Coolify</strong>' + esc(error) + '</div>'
-    : (cards || '<div class="empty"><strong>No applications found</strong>Deploy something and it will appear here.</div>');
+function cardHtml(item) {
+  const name = displayName(item);
+  const host = domainKey(item.url);
+  const url = normalizeUrl(item.url);
+  const st = statusInfo(item.status);
+  const hay = (name + ' ' + host + ' ' + (item.source || '')).toLowerCase();
+  const customIcon = customIconHtml(item);
+  const avatarContent = customIcon || (
+    '<span class="inits">' + esc(initials(name)) + '</span>'
+    + '<img class="logo" alt="" referrerpolicy="no-referrer" data-srcs="' + esc(logoSources(item)) + '">'
+  );
+  const manualBadge = item.custom ? '<span class="manual-badge">Manual</span>' : '';
 
-  const searchBar = error || !count ? '' :
+  return '<a class="card" href="' + esc(url) + '" target="_blank" rel="noopener"'
+    + ' data-hay="' + esc(hay) + '" title="' + esc(host) + '">'
+    + '<span class="avatar" style="background:' + gradientFor(name) + '">' + avatarContent + '</span>'
+    + '<span class="body">'
+    + '<span class="name-row"><span class="name">' + esc(name) + '</span>' + manualBadge + '</span>'
+    + '<span class="host">' + esc(host) + '</span>'
+    + '</span>'
+    + '<span class="tail">'
+    + '<span class="pill ' + st.tone + '"><span class="dot"></span>' + esc(st.label) + '</span>'
+    + '<svg class="arrow" viewBox="0 0 16 16" fill="none" aria-hidden="true">'
+    + '<path d="M6 3h7v7M13 3 4.5 11.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>'
+    + '</svg>'
+    + '</span>'
+    + '</a>';
+}
+
+function page(items = [], errors = []) {
+  const cards = items.map(cardHtml).join('');
+  const warning = errors.length
+    ? '<div class="notice"><strong>Coolify API warning</strong><span>' + errors.map(esc).join(' · ') + '</span></div>'
+    : '';
+  const empty = items.length === 0
+    ? '<div class="empty"><strong>No applications or links found</strong>Deploy something in Coolify or add an entry to custom_links.json.</div>'
+    : '';
+  const body = warning + cards + empty;
+
+  const searchBar = !items.length ? '' :
     '<div class="search">'
     + '<svg viewBox="0 0 16 16" fill="none" aria-hidden="true"><circle cx="7" cy="7" r="4.6" stroke="currentColor" stroke-width="1.5"/><path d="m10.6 10.6 2.9 2.9" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>'
-    + '<input id="q" type="search" placeholder="Filter apps" autocomplete="off" aria-label="Filter applications">'
+    + '<input id="q" type="search" placeholder="Filter apps &amp; links" autocomplete="off" aria-label="Filter applications and links">'
     + '</div>';
 
-  const subtitle = error ? 'Connection problem'
-    : '<b>' + count + '</b> ' + (count === 1 ? 'application' : 'applications') + ' deployed';
+  const subtitle = '<b>' + items.length + '</b> ' + (items.length === 1 ? 'app or link' : 'apps &amp; links') + (errors.length ? ' · API warning' : ' live');
 
   return '<!DOCTYPE html>\n<html lang="en">\n<head>'
     + '<meta charset="UTF-8">'
     + '<meta name="viewport" content="width=device-width,initial-scale=1">'
     + '<meta name="color-scheme" content="dark">'
-    + '<title>Applications \u00b7 Coolify</title>'
-    + '<link rel="icon" href="data:image/svg+xml,'
-    + encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><rect width="32" height="32" rx="8" fill="#6366f1"/><rect x="8" y="9" width="7" height="6" rx="1.5" fill="#fff"/><rect x="17" y="9" width="7" height="6" rx="1.5" fill="#fff" opacity=".65"/><rect x="8" y="17" width="16" height="6" rx="1.5" fill="#fff" opacity=".4"/></svg>')
-    + '">'
+    + '<title>Web Directory · Coolify</title>'
+    + '<link rel="icon" href="data:image/svg+xml,' + encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><rect width="32" height="32" rx="8" fill="#6366f1"/><rect x="8" y="9" width="7" height="6" rx="1.5" fill="#fff"/><rect x="17" y="9" width="7" height="6" rx="1.5" fill="#fff" opacity=".65"/><rect x="8" y="17" width="16" height="6" rx="1.5" fill="#fff" opacity=".4"/></svg>') + '">'
     + '<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>'
     + '<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">'
     + '<style>' + STYLE + '</style>'
@@ -279,12 +515,12 @@ function page(cards, count, error) {
     + '<header>'
     + '<div class="brand">'
     + '<span class="mark"><svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><rect x="3" y="4" width="7.5" height="7" rx="1.8"/><rect x="13.5" y="4" width="7.5" height="7" rx="1.8" opacity=".6"/><rect x="3" y="13" width="18" height="7" rx="1.8" opacity=".35"/></svg></span>'
-    + '<div><h1>Applications</h1><p class="sub">' + subtitle + '</p></div>'
+    + '<div><h1>Web Directory</h1><p class="sub">' + subtitle + '</p></div>'
     + '</div>'
     + searchBar
     + '</header>'
     + '<main class="grid" id="grid">' + body + '</main>'
-    + '<footer>Live from Coolify \u00b7 updates on refresh</footer>'
+    + '<footer>Live from Coolify · applications, services &amp; manual links</footer>'
     + '</div>'
     + '<script>'
     + 'document.querySelectorAll("img.logo").forEach(function(img){'
@@ -302,61 +538,137 @@ function page(cards, count, error) {
     + '</script>'
     + '</body></html>';
 }
-
-function fetchJson(url, token, redirects) {
-  redirects = redirects || 0;
+function fetchCoolifyJson(url, token, redirects = 0) {
   return new Promise((resolve, reject) => {
-    const parsed = new URL(url);
-    const req = https.request({
+    let parsed;
+    try {
+      parsed = new URL(url);
+    } catch {
+      return reject(new Error('Invalid Coolify URL: ' + url));
+    }
+
+    const client = parsed.protocol === 'http:' ? http : https;
+    const options = {
       hostname: parsed.hostname,
+      port: parsed.port || (parsed.protocol === 'http:' ? 80 : 443),
       path: parsed.pathname + parsed.search,
       method: 'GET',
-      headers: { Authorization: 'Bearer ' + token, Accept: 'application/json' },
-    }, res => {
+      headers: {
+        Authorization: 'Bearer ' + token,
+        Accept: 'application/json',
+        'User-Agent': 'coolify-web-directory/1.0',
+      },
+    };
+
+    const req = client.request(options, res => {
       const status = res.statusCode || 0;
       if (status >= 300 && status < 400 && res.headers.location && redirects < 3) {
         res.resume();
         const next = new URL(res.headers.location, url).toString();
-        return resolve(fetchJson(next, token, redirects + 1));
+        return resolve(fetchCoolifyJson(next, token, redirects + 1));
       }
+
       let body = '';
       res.setEncoding('utf8');
-      res.on('data', c => (body += c));
+      res.on('data', chunk => (body += chunk));
       res.on('end', () => {
-        if (status !== 200) return reject(new Error('Coolify API returned HTTP ' + status));
-        try { resolve(JSON.parse(body)); }
-        catch (e) { reject(new Error('Coolify API returned invalid JSON')); }
+        if (status === 401) {
+          return reject(new Error('401 Unauthorized - check COOLIFY_API_TOKEN'));
+        }
+        if (status !== 200) {
+          return reject(new Error('HTTP ' + status + ' from ' + parsed.pathname));
+        }
+        try {
+          resolve(JSON.parse(body));
+        } catch (err) {
+          reject(new Error('Invalid JSON from ' + parsed.pathname + ': ' + err.message));
+        }
       });
     });
+
     req.on('error', reject);
     req.setTimeout(15000, () => req.destroy(new Error('Coolify API timed out')));
     req.end();
   });
 }
 
+function buildCoolifyUrl(instanceUrl, pathname) {
+  return instanceUrl.replace(/\/+$/, '') + pathname;
+}
+
 app.get('/', async (req, res) => {
-  const base = String(process.env.COOLIFY_INSTANCE_URL || '').replace(/\/+$/, '');
-  const token = process.env.COOLIFY_API_TOKEN || '';
+  const base = String(process.env.COOLIFY_INSTANCE_URL || '').trim().replace(/\/+$/, '');
+  const token = String(process.env.COOLIFY_API_TOKEN || '').trim();
 
   if (!base || !token) {
-    res.status(500).send(page('', 0, 'COOLIFY_INSTANCE_URL and COOLIFY_API_TOKEN must be set'));
-    return;
+    return res.status(500).send(page([], ['COOLIFY_INSTANCE_URL and COOLIFY_API_TOKEN must be set']));
   }
 
-  try {
-    const apps = await fetchJson(base + '/api/v1/applications', token);
-    const list = (Array.isArray(apps) ? apps : [])
-      .filter(a => a && a.fqdn && String(a.status || '').toLowerCase() !== 'stopped')
-      .sort((a, b) => displayName(a).localeCompare(displayName(b)));
+  const errors = [];
+  const automated = [];
 
-    const cards = list.map(cardHtml).join('');
-    res.send(page(cards, list.length, null));
-  } catch (err) {
-    console.error('Coolify request failed:', err.message);
-    res.status(502).send(page('', 0, err.message));
+  const [appsResult, servicesResult] = await Promise.allSettled([
+    fetchCoolifyJson(buildCoolifyUrl(base, '/api/v1/applications'), token),
+    fetchCoolifyJson(buildCoolifyUrl(base, '/api/v1/services'), token),
+  ]);
+
+  if (appsResult.status === 'fulfilled') {
+    for (const app of asArray(appsResult.value)) {
+      automated.push(...normalizeCoolifyItem(app, 'application'));
+    }
+  } else {
+    const message = appsResult.reason?.message || 'Unknown error';
+    console.error('Applications endpoint failed:', message);
+    errors.push('Applications: ' + message);
   }
+
+  if (servicesResult.status === 'fulfilled') {
+    for (const service of asArray(servicesResult.value)) {
+      automated.push(...normalizeCoolifyItem(service, 'service'));
+    }
+  } else {
+    const message = servicesResult.reason?.message || 'Unknown error';
+    console.error('Services endpoint failed:', message);
+    errors.push('Services: ' + message);
+  }
+
+  const filtered = dedupeItems(automated).filter(item => {
+    const status = String(item.status || '').toLowerCase();
+    return Boolean(item.url) && !status.startsWith('stopped');
+  });
+
+  const items = mergeItems(filtered, loadCustomLinks())
+    .sort((a, b) => displayName(a).localeCompare(displayName(b)));
+
+  res.send(page(items, errors));
 });
 
-app.listen(PORT, () => {
-  console.log('Coolify Web Directory running on port ' + PORT);
+app.use((err, req, res, next) => {
+  console.error('Unhandled error:', err);
+  res.status(500).send('Internal server error');
 });
+
+if (require.main === module) {
+  app.listen(PORT, () => {
+    console.log('Coolify Web Directory running on port ' + PORT);
+  });
+}
+
+module.exports = {
+  app,
+  asArray,
+  cardHtml,
+  customIconHtml,
+  dedupeItems,
+  displayName,
+  domainKey,
+  extractDomains,
+  fetchCoolifyJson,
+  loadCustomLinks,
+  logoSources,
+  mergeItems,
+  normalizeCoolifyItem,
+  normalizeUrl,
+  page,
+  statusInfo,
+};
