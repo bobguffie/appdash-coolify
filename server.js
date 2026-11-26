@@ -43,7 +43,7 @@ function looksLikeDomain(value) {
   if (typeof value !== 'string') return false;
   const trimmed = value.trim();
   if (!trimmed || /\s/.test(trimmed)) return false;
-  return /^(https?:\/\/)?[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+(?::\d+)?(?:\/.*)?$/i.test(trimmed);
+  return /^(https?:\/\/)?[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+(?::\d+)?(?:[/?#].*)?$/i.test(trimmed);
 }
 
 function normalizeUrl(value) {
@@ -341,7 +341,14 @@ function mergeItems(automated, custom) {
   for (const item of automated) {
     const key = domainKey(item.url);
     if (key && !merged.has(key)) {
-      merged.set(key, { ...item, isHidden: false, hasCustomName: false, hasCustomIcon: false });
+      merged.set(key, {
+        ...item,
+        editDomain: key,
+        isHidden: false,
+        hasCustomName: false,
+        hasCustomIcon: false,
+        hasCustomUrl: false,
+      });
     }
   }
 
@@ -351,12 +358,16 @@ function mergeItems(automated, custom) {
 
     if (merged.has(matchKey)) {
       const existing = merged.get(matchKey);
+      existing.editDomain = matchKey;
       if (entry.hasName && entry.name) {
         existing.name = entry.name;
         existing.manualName = true;
         existing.hasCustomName = true;
       }
-      if (entry.hasUrl && entry.url) existing.url = entry.url;
+      if (entry.hasUrl && entry.url) {
+        existing.url = entry.url;
+        existing.hasCustomUrl = true;
+      }
       if (entry.icon != null && entry.icon !== '') {
         existing.icon = entry.icon;
         existing.hasCustomIcon = true;
@@ -372,8 +383,10 @@ function mergeItems(automated, custom) {
         icon: entry.icon,
         custom: true,
         manualName: true,
+        editDomain: matchKey,
         hasCustomName: Boolean(entry.hasName && entry.name),
         hasCustomIcon: Boolean(entry.hasIcon || entry.icon),
+        hasCustomUrl: Boolean(entry.hasUrl),
         isHidden: Boolean(entry.hasHide),
       });
     }
@@ -529,6 +542,7 @@ function saveCustomLinkUpdates(updates) {
   }
 
   let updated = 0;
+  let createdCount = 0;
   for (const update of updates) {
     const existingEntry = byKey.get(update.key);
     const created = !existingEntry;
@@ -574,6 +588,7 @@ function saveCustomLinkUpdates(updates) {
       if (!meaningful) continue;
       byKey.set(update.key, entry);
       entries.push(entry);
+      createdCount += 1;
     }
     updated += 1;
   }
@@ -581,7 +596,7 @@ function saveCustomLinkUpdates(updates) {
   const filePath = customLinksPath();
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
   fs.writeFileSync(filePath, JSON.stringify({ links: entries }, null, 2) + '\n', 'utf8');
-  return { updated, links: entries.length };
+  return { updated, created: createdCount, links: entries.length };
 }
 
 function handleCustomLinksSave(req, res) {
@@ -592,7 +607,7 @@ function handleCustomLinksSave(req, res) {
     }
     const updates = rawUpdates.map(normalizeLinkUpdate);
     const result = saveCustomLinkUpdates(updates);
-    return res.json({ ok: true, updated: result.updated, links: result.links });
+    return res.json({ ok: true, updated: result.updated, created: result.created, links: result.links });
   } catch (err) {
     if (err instanceof BadRequestError) {
       return res.status(400).json({ error: err.message });
@@ -698,6 +713,7 @@ const STYLE = `
     header{margin-bottom:24px}
     h1{font-size:20px}
     .search{max-width:none;width:100%}
+    .add-link{width:100%;justify-content:center}
     .grid{grid-template-columns:1fr;gap:12px}
     .card{padding:17px 16px;gap:14px}
     .avatar{width:46px;height:46px;border-radius:12px;font-size:14px}
@@ -715,6 +731,12 @@ const STYLE = `
   .avatar .emoji{font-size:34px;line-height:1;position:relative;z-index:1}
   .card-wrap{display:flex;flex-direction:column;min-width:0}
   .card-wrap .card{width:100%}
+  .card-wrap.is-new .card{border-style:dashed;border-color:rgba(129,140,248,.5);
+    background:linear-gradient(180deg,rgba(129,140,248,.08),rgba(17,20,29,.9))}
+  .card-wrap.is-new .name{color:#dbe2ff}
+  .card-wrap.is-new .host{color:#8f9bc7}
+  .draft-badge{color:#c7d2fe!important;background:rgba(129,140,248,.16)!important;
+    box-shadow:inset 0 0 0 1px rgba(129,140,248,.3)!important}
   .card-wrap.is-hidden{display:none}
   .card-wrap.filtered{display:none!important}
   body.editing .card-wrap.is-hidden{display:flex}
@@ -742,6 +764,11 @@ const STYLE = `
   .btn.primary:hover{background:linear-gradient(135deg,#7377f5,#9a6ef8)}
   .btn.ghost{color:var(--muted);background:transparent}
   .btn[disabled]{opacity:.45;cursor:not-allowed;transform:none}
+  .add-link{display:none;align-items:center;gap:7px;padding:10px 15px;font-size:13px;
+    border-color:rgba(129,140,248,.55);background:rgba(129,140,248,.13);color:#c7d2fe;
+    box-shadow:0 8px 22px -18px rgba(99,102,241,.95)}
+  .add-link:hover{border-color:rgba(129,140,248,.82);background:rgba(129,140,248,.21);color:#e0e7ff}
+  body.editing .add-link{display:inline-flex}
   .edit-status{font-size:12px;color:var(--muted);min-width:112px;text-align:right}
   body.has-edits .edit-status{color:#fbbf24}
 
@@ -759,13 +786,19 @@ const STYLE = `
   .hide-btn.is-off{color:#fbbf24;border-color:rgba(251,191,36,.34);background:rgba(251,191,36,.09)}
   .hide-btn.is-off .eye-open{display:none}
   .hide-btn.is-off .eye-off{display:inline}
-  .editor-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+  .remove-btn{display:inline-flex;align-items:center;border:1px solid rgba(248,113,113,.3);
+    background:rgba(248,113,113,.08);color:#fca5a5;border-radius:7px;padding:5px 9px;
+    font:inherit;font-size:11.5px;font-weight:600;cursor:pointer}
+  .remove-btn:hover{border-color:rgba(248,113,113,.55);background:rgba(248,113,113,.14);color:#fecaca}
+  .editor-grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.35fr);gap:10px}
   .field{display:flex;flex-direction:column;gap:5px;min-width:0}
+  .field.field-wide{grid-column:1/-1}
   .field span{font-size:10.5px;font-weight:600;letter-spacing:.045em;text-transform:uppercase;color:#737b94}
   .field input{width:100%;padding:8px 10px;border-radius:8px;border:1px solid var(--line);
     background:rgba(255,255,255,.035);color:var(--text);font:inherit;font-size:13px;outline:none}
   .field input::placeholder{color:#5f6780}
   .field input:focus{border-color:var(--line-hi);background:rgba(255,255,255,.06)}
+  .new-hint{margin:9px 0 0;color:#737b94;font-size:11.5px;line-height:1.45}
   .card-wrap.dirty .card{border-color:rgba(251,191,36,.55)}
   .card-wrap.dirty .editor{box-shadow:inset 0 0 0 1px rgba(251,191,36,.16)}
 
@@ -802,35 +835,64 @@ const STYLE = `
 `;
 
 function cardHtml(item) {
-  const name = displayName(item);
-  const host = domainKey(item.url);
-  const url = normalizeUrl(item.url);
+  const isNew = Boolean(item.isNew);
+  const name = isNew ? 'New custom link' : displayName(item);
+  const url = isNew ? '' : normalizeUrl(item.url);
+  const host = isNew ? '' : domainKey(url);
+  const editDomain = isNew ? '' : (item.editDomain || host);
   const st = statusInfo(item.status);
-  const hay = (name + ' ' + host + ' ' + (item.source || '')).toLowerCase();
-  const customIcon = customIconHtml(item);
-  const iconValue = item.icon == null ? '' : String(item.icon);
+  const hay = (name + ' ' + host + ' ' + (item.source || '') + (isNew ? ' new custom link draft' : '')).toLowerCase();
+  const customIcon = isNew ? '' : customIconHtml(item);
+  const iconValue = isNew || item.icon == null ? '' : String(item.icon);
   const isHidden = Boolean(item.isHidden);
-  const avatarContent = customIcon || (
-    '<span class="inits">' + esc(initials(name)) + '</span>'
-    + '<img class="logo" alt="" referrerpolicy="no-referrer" data-srcs="' + esc(logoSources(item)) + '">'
-  );
-  const manualBadge = item.custom ? '<span class="manual-badge">Manual</span>' : '';
+  const avatarContent = isNew
+    ? '<span class="inits">+</span>'
+    : customIcon || (
+      '<span class="inits">' + esc(initials(name)) + '</span>'
+      + '<img class="logo" alt="" referrerpolicy="no-referrer" data-srcs="' + esc(logoSources(item)) + '">'
+    );
+  const manualBadge = isNew
+    ? '<span class="manual-badge draft-badge">Draft</span>'
+    : item.custom ? '<span class="manual-badge">Manual</span>' : '';
   const hiddenBadge = '<span class="hidden-flag">Hidden</span>';
+  const displayHost = isNew ? 'Enter a URL' : host;
+  const editorKicker = isNew ? 'New custom link' : 'Card settings';
+  const nameValue = isNew ? '' : name;
+  const hideControl = isNew
+    ? '<button type="button" class="remove-btn" data-remove-new title="Remove this draft">Remove</button>'
+    : '<button type="button" class="hide-btn' + (isHidden ? ' is-off' : '') + '" data-hide'
+      + ' aria-pressed="' + (isHidden ? 'true' : 'false') + '" title="' + (isHidden ? 'Show this card' : 'Hide this card') + '">'
+      + '<svg class="eye-open" viewBox="0 0 16 16" fill="none" aria-hidden="true">'
+      + '<path d="M1.5 8s2.4-4.3 6.5-4.3S14.5 8 14.5 8s-2.4 4.3-6.5 4.3S1.5 8 1.5 8Z" stroke="currentColor" stroke-width="1.35"/>'
+      + '<circle cx="8" cy="8" r="2" stroke="currentColor" stroke-width="1.35"/>'
+      + '</svg>'
+      + '<svg class="eye-off" viewBox="0 0 16 16" fill="none" aria-hidden="true">'
+      + '<path d="m2 2 12 12M6.3 4.1A6.9 6.9 0 0 1 8 3.7c4.1 0 6.5 4.3 6.5 4.3a11.4 11.4 0 0 1-2.1 2.5M9.7 11.9A6.9 6.9 0 0 1 8 12.3C3.9 12.3 1.5 8 1.5 8a11.4 11.4 0 0 1 2.1-2.5" stroke="currentColor" stroke-width="1.35" stroke-linecap="round"/>'
+      + '</svg>'
+      + '<span data-hide-label>' + (isHidden ? 'Show' : 'Hide') + '</span></button>';
+  const newHint = isNew
+    ? '<p class="new-hint">Name and URL are required. The URL hostname becomes the key in custom_links.json.</p>'
+    : '';
 
-  return '<div class="card-wrap' + (isHidden ? ' is-hidden' : '') + '"'
-    + ' data-domain="' + esc(host) + '"'
-    + ' data-name="' + esc(name) + '"'
+  return '<div class="card-wrap' + (isNew ? ' is-new' : '') + (isHidden ? ' is-hidden' : '') + '"'
+    + ' data-domain="' + esc(editDomain) + '"'
+    + ' data-display-domain="' + esc(host) + '"'
+    + ' data-name="' + esc(nameValue) + '"'
+    + ' data-url="' + esc(url) + '"'
     + ' data-icon="' + esc(iconValue) + '"'
     + ' data-hidden="' + (isHidden ? '1' : '0') + '"'
     + ' data-original-hidden="' + (isHidden ? '1' : '0') + '"'
     + ' data-has-name="' + (item.hasCustomName ? '1' : '0') + '"'
+    + ' data-has-url="' + (item.hasCustomUrl ? '1' : '0') + '"'
     + ' data-has-icon="' + (item.icon ? '1' : '0') + '"'
+    + ' data-is-new="' + (isNew ? '1' : '0') + '"'
     + ' data-hay="' + esc(hay) + '">'
-    + '<a class="card" href="' + esc(url) + '" target="_blank" rel="noopener" title="' + esc(host) + '">'
+    + '<a class="card" href="' + esc(isNew ? '#' : url) + '" target="_blank" rel="noopener" title="' + esc(isNew ? 'New custom link' : host) + '"'
+    + (isNew ? ' aria-disabled="true"' : '') + '>'
     + '<span class="avatar" style="background:' + gradientFor(name) + '">' + avatarContent + '</span>'
     + '<span class="body">'
     + '<span class="name-row"><span class="name">' + esc(name) + '</span>' + manualBadge + hiddenBadge + '</span>'
-    + '<span class="host">' + esc(host) + '</span>'
+    + '<span class="host">' + esc(displayHost) + '</span>'
     + '</span>'
     + '<span class="tail">'
     + '<span class="pill ' + st.tone + '"><span class="dot"></span>' + esc(st.label) + '</span>'
@@ -840,22 +902,13 @@ function cardHtml(item) {
     + '</span>'
     + '</a>'
     + '<div class="editor" aria-label="Edit settings for ' + esc(name) + '">'
-    + '<div class="editor-top"><span class="editor-kicker">Card settings</span>'
-    + '<button type="button" class="hide-btn' + (isHidden ? ' is-off' : '') + '" data-hide'
-    + ' aria-pressed="' + (isHidden ? 'true' : 'false') + '" title="' + (isHidden ? 'Show this card' : 'Hide this card') + '">'
-    + '<svg class="eye-open" viewBox="0 0 16 16" fill="none" aria-hidden="true">'
-    + '<path d="M1.5 8s2.4-4.3 6.5-4.3S14.5 8 14.5 8s-2.4 4.3-6.5 4.3S1.5 8 1.5 8Z" stroke="currentColor" stroke-width="1.35"/>'
-    + '<circle cx="8" cy="8" r="2" stroke="currentColor" stroke-width="1.35"/>'
-    + '</svg>'
-    + '<svg class="eye-off" viewBox="0 0 16 16" fill="none" aria-hidden="true">'
-    + '<path d="m2 2 12 12M6.3 4.1A6.9 6.9 0 0 1 8 3.7c4.1 0 6.5 4.3 6.5 4.3a11.4 11.4 0 0 1-2.1 2.5M9.7 11.9A6.9 6.9 0 0 1 8 12.3C3.9 12.3 1.5 8 1.5 8a11.4 11.4 0 0 1 2.1-2.5" stroke="currentColor" stroke-width="1.35" stroke-linecap="round"/>'
-    + '</svg>'
-    + '<span data-hide-label>' + (isHidden ? 'Show' : 'Hide') + '</span></button>'
-    + '</div>'
+    + '<div class="editor-top"><span class="editor-kicker">' + editorKicker + '</span>' + hideControl + '</div>'
     + '<div class="editor-grid">'
-    + '<label class="field"><span>Name</span><input type="text" data-field="name" value="' + esc(name) + '" maxlength="200" autocomplete="off" spellcheck="false" placeholder="Card name"></label>'
-    + '<label class="field"><span>Emoji or logo URL</span><input type="text" data-field="icon" value="' + esc(iconValue) + '" maxlength="8192" autocomplete="off" spellcheck="false" placeholder="🚀 or https://…"></label>'
+    + '<label class="field"><span>Name</span><input type="text" data-field="name" value="' + esc(nameValue) + '" maxlength="200" autocomplete="off" spellcheck="false" placeholder="Card name"></label>'
+    + '<label class="field"><span>URL</span><input type="text" data-field="url" value="' + esc(url) + '" maxlength="2048" autocomplete="off" spellcheck="false" placeholder="https://app.example.com"></label>'
+    + '<label class="field field-wide"><span>Emoji or logo URL</span><input type="text" data-field="icon" value="' + esc(iconValue) + '" maxlength="8192" autocomplete="off" spellcheck="false" placeholder="🚀 or https://…"></label>'
     + '</div>'
+    + newHint
     + '</div>'
     + '</div>';
 }
@@ -875,6 +928,9 @@ const CLIENT_SCRIPT = String.raw`
   var tokenInput = document.getElementById('admin-token');
   var adminError = document.getElementById('admin-error');
   var adminCancel = document.getElementById('admin-cancel');
+  var addButton = document.getElementById('add-link');
+  var grid = document.getElementById('grid');
+  var newTemplate = document.getElementById('new-card-template');
   var toastEl = document.getElementById('toast');
   var adminToken = '';
   var toastTimer = null;
@@ -893,6 +949,34 @@ const CLIENT_SCRIPT = String.raw`
     if (!words.length) return '?';
     if (words.length === 1) return words[0].slice(0, 2).toUpperCase();
     return (words[0].charAt(0) + words[1].charAt(0)).toUpperCase();
+  }
+
+  function parseLinkUrl(value) {
+    var raw = String(value || '').trim();
+    if (!raw) return null;
+    var candidate = /^https?:\/\//i.test(raw)
+      ? raw
+      : 'https://' + raw.replace(/^\/+/, '');
+    var parsed;
+    try {
+      parsed = new URL(candidate);
+    } catch (err) {
+      return null;
+    }
+    if (!/^https?:$/i.test(parsed.protocol) || !parsed.hostname) return null;
+    if (parsed.username || parsed.password) return null;
+    if (!/^(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+$/i.test(parsed.hostname)) {
+      return null;
+    }
+    return {
+      domain: parsed.hostname.replace(/^www\./i, '').toLowerCase(),
+      url: candidate.replace(/\/+$/, '')
+    };
+  }
+
+  function domainFromUrl(value) {
+    var parsed = parseLinkUrl(value);
+    return parsed ? parsed.domain : '';
   }
 
   function initLogos(root) {
@@ -915,17 +999,33 @@ const CLIENT_SCRIPT = String.raw`
 
   function changeFor(wrap) {
     var nameInput = wrap.querySelector('[data-field="name"]');
+    var urlInput = wrap.querySelector('[data-field="url"]');
     var iconInput = wrap.querySelector('[data-field="icon"]');
-    if (!nameInput || !iconInput) return null;
+    if (!nameInput || !urlInput || !iconInput) return null;
 
+    var isNew = wrap.getAttribute('data-is-new') === '1';
     var originalName = wrap.getAttribute('data-name') || '';
+    var originalUrl = wrap.getAttribute('data-url') || '';
     var originalIcon = wrap.getAttribute('data-icon') || '';
     var hasName = wrap.getAttribute('data-has-name') === '1';
+    var hasUrl = wrap.getAttribute('data-has-url') === '1';
     var hasIcon = wrap.getAttribute('data-has-icon') === '1';
     var hidden = wrap.getAttribute('data-hidden') === '1';
     var originalHidden = wrap.getAttribute('data-original-hidden') === '1';
     var nameValue = nameInput.value.trim();
+    var urlValue = urlInput.value.trim();
     var iconValue = iconInput.value.trim();
+
+    if (isNew) {
+      if (!nameValue && !urlValue && !iconValue) return null;
+      return {
+        domain: domainFromUrl(urlValue),
+        name: nameValue,
+        url: urlValue,
+        icon: iconValue
+      };
+    }
+
     var entry = null;
 
     function ensure() {
@@ -936,6 +1036,12 @@ const CLIENT_SCRIPT = String.raw`
       if (nameValue || hasName) {
         ensure();
         entry.name = nameValue;
+      }
+    }
+    if (urlValue !== originalUrl) {
+      if (urlValue || hasUrl) {
+        ensure();
+        entry.url = urlValue;
       }
     }
     if (iconValue !== originalIcon) {
@@ -975,13 +1081,78 @@ const CLIENT_SCRIPT = String.raw`
     return changes;
   }
 
+  function validateChanges() {
+    var wraps = document.querySelectorAll('.card-wrap');
+    for (var i = 0; i < wraps.length; i += 1) {
+      var wrap = wraps[i];
+      var change = changeFor(wrap);
+      if (!change) continue;
+      var isNew = wrap.getAttribute('data-is-new') === '1';
+      if (isNew && !change.name) {
+        return { message: 'Enter a name for the new custom link.', wrap: wrap, field: 'name' };
+      }
+      if (isNew && !change.url) {
+        return { message: 'Enter a URL for the new custom link.', wrap: wrap, field: 'url' };
+      }
+      if (change.url && !parseLinkUrl(change.url)) {
+        return {
+          message: 'Enter a valid http(s) URL. Example: https://app.example.com:8090',
+          wrap: wrap,
+          field: 'url'
+        };
+      }
+    }
+    return null;
+  }
+
+  function focusField(wrap, field) {
+    if (!wrap || !field) return;
+    var input = wrap.querySelector('[data-field="' + field + '"]');
+    if (!input) return;
+    if (wrap.scrollIntoView) wrap.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    setTimeout(function(){ input.focus(); }, 200);
+  }
+
   function previewName(wrap) {
     var input = wrap.querySelector('[data-field="name"]');
     var nameEl = wrap.querySelector('.name');
     if (!input || !nameEl) return;
     var value = input.value.trim();
-    nameEl.textContent = value || wrap.getAttribute('data-domain') || '';
-    var hay = (value + ' ' + (wrap.getAttribute('data-domain') || '')).toLowerCase();
+    var isNew = wrap.getAttribute('data-is-new') === '1';
+    var host = wrap.getAttribute('data-display-domain') || '';
+    var urlInput = wrap.querySelector('[data-field="url"]');
+    var parsedUrl = urlInput ? parseLinkUrl(urlInput.value) : null;
+    if (parsedUrl) host = parsedUrl.domain;
+    nameEl.textContent = value || (isNew ? 'New custom link' : host);
+    var hay = (value + ' ' + host + (isNew ? ' new custom link' : '')).toLowerCase();
+    wrap.setAttribute('data-hay', hay);
+
+    if (isNew) {
+      var iconInput = wrap.querySelector('[data-field="icon"]');
+      if (!iconInput || !iconInput.value.trim()) {
+        var avatar = wrap.querySelector('.avatar');
+        if (avatar) {
+          avatar.innerHTML = '<span class="inits">' + initialsFor(value || 'New custom link') + '</span>';
+        }
+      }
+    }
+  }
+
+  function previewUrl(wrap) {
+    var input = wrap.querySelector('[data-field="url"]');
+    var hostEl = wrap.querySelector('.host');
+    if (!input || !hostEl) return;
+    var value = input.value.trim();
+    var isNew = wrap.getAttribute('data-is-new') === '1';
+    var parsed = parseLinkUrl(value);
+    if (!value) {
+      hostEl.textContent = isNew ? 'Enter a URL' : (wrap.getAttribute('data-display-domain') || '');
+    } else {
+      hostEl.textContent = parsed ? parsed.domain : 'Invalid URL';
+    }
+    var nameInput = wrap.querySelector('[data-field="name"]');
+    var nameValue = nameInput ? nameInput.value.trim() : '';
+    var hay = (nameValue + ' ' + (parsed ? parsed.domain : '') + (isNew ? ' new custom link' : '')).toLowerCase();
     wrap.setAttribute('data-hay', hay);
   }
 
@@ -994,12 +1165,15 @@ const CLIENT_SCRIPT = String.raw`
     }
     var original = avatar.getAttribute('data-original-html');
     var value = input.value.trim();
+    var isNew = wrap.getAttribute('data-is-new') === '1';
     avatar.innerHTML = '';
 
     if (!value) {
-      if (wrap.getAttribute('data-has-icon') === '1') {
+      if (wrap.getAttribute('data-has-icon') === '1' || isNew) {
         var nameInput = wrap.querySelector('[data-field="name"]');
-        var fallbackName = (nameInput && nameInput.value.trim()) || wrap.getAttribute('data-name');
+        var fallbackName = (nameInput && nameInput.value.trim())
+          || wrap.getAttribute('data-name')
+          || (isNew ? 'New custom link' : '');
         avatar.innerHTML = '<span class="inits">' + initialsFor(fallbackName) + '</span>';
       } else {
         avatar.innerHTML = original;
@@ -1051,6 +1225,7 @@ const CLIENT_SCRIPT = String.raw`
       window.location.reload();
       return;
     }
+    document.querySelectorAll('.card-wrap.is-new').forEach(function(node){ node.remove(); });
     body.classList.remove('editing');
     body.classList.remove('has-edits');
     adminToken = '';
@@ -1061,10 +1236,38 @@ const CLIENT_SCRIPT = String.raw`
     updateDirty();
   }
 
+  function addNewCard() {
+    if (!grid || !newTemplate || !newTemplate.content) {
+      showToast('Could not open the new-link form.', 'error');
+      return;
+    }
+    var existingDraft = grid.querySelector('.card-wrap.is-new');
+    if (existingDraft) {
+      focusField(existingDraft, 'name');
+      showToast('Finish or remove the current new link first.', 'info');
+      return;
+    }
+    var fragment = newTemplate.content.cloneNode(true);
+    var node = fragment.querySelector('.card-wrap');
+    if (!node) return;
+    var avatar = node.querySelector('.avatar');
+    if (avatar) avatar.setAttribute('data-original-html', avatar.innerHTML);
+    grid.insertBefore(fragment, grid.firstChild);
+    initLogos(node);
+    updateDirty();
+    focusField(node, 'name');
+  }
+
   function saveChanges() {
     var changes = updateDirty();
     if (!changes.length) {
       showToast('No changes to save.', 'info');
+      return;
+    }
+    var invalid = validateChanges();
+    if (invalid) {
+      showToast(invalid.message, 'error');
+      focusField(invalid.wrap, invalid.field);
       return;
     }
     if (!adminToken) {
@@ -1097,7 +1300,11 @@ const CLIENT_SCRIPT = String.raw`
       allowLeave = true;
       adminToken = '';
       body.classList.remove('editing');
-      showToast('Saved ' + (data.updated || changes.length) + ' change' + ((data.updated || changes.length) === 1 ? '' : 's') + '. Reloading…', 'ok');
+      var saved = data.updated || changes.length;
+      var created = Number(data.created) || 0;
+      var message = 'Saved ' + saved + ' change' + (saved === 1 ? '' : 's');
+      if (created) message += ' · ' + created + ' new link' + (created === 1 ? '' : 's');
+      showToast(message + '. Reloading…', 'ok');
       setTimeout(function(){ window.location.reload(); }, 350);
     }).catch(function(error){
       saveButton.disabled = false;
@@ -1160,6 +1367,7 @@ const CLIENT_SCRIPT = String.raw`
   }
 
   if (saveButton) saveButton.addEventListener('click', saveChanges);
+  if (addButton) addButton.addEventListener('click', addNewCard);
 
   if (discardButton) {
     discardButton.addEventListener('click', function(){
@@ -1180,11 +1388,25 @@ const CLIENT_SCRIPT = String.raw`
     var wrap = input.closest('.card-wrap');
     if (!wrap) return;
     if (input.getAttribute('data-field') === 'name') previewName(wrap);
+    if (input.getAttribute('data-field') === 'url') previewUrl(wrap);
     if (input.getAttribute('data-field') === 'icon') previewIcon(wrap);
     updateDirty();
   });
 
   document.addEventListener('click', function(event){
+    var removeButton = event.target && event.target.closest
+      ? event.target.closest('[data-remove-new]')
+      : null;
+    if (removeButton) {
+      var draft = removeButton.closest('.card-wrap');
+      if (draft) {
+        event.preventDefault();
+        draft.remove();
+        updateDirty();
+      }
+      return;
+    }
+
     var button = event.target && event.target.closest ? event.target.closest('[data-hide]') : null;
     if (!button) return;
     var wrap = button.closest('.card-wrap');
@@ -1230,6 +1452,9 @@ function page(items = [], errors = [], options = {}) {
   const adminEnabled = Boolean(options.adminEnabled);
   const visibleCount = items.filter(item => !item.isHidden).length;
   const cards = items.map(cardHtml).join('');
+  const newCardTemplate = '<template id="new-card-template">'
+    + cardHtml({ isNew: true, url: '', status: 'manual', source: 'custom', custom: true })
+    + '</template>';
   const warning = errors.length
     ? '<div class="notice"><strong>Coolify API warning</strong><span>' + errors.map(esc).join(' · ') + '</span></div>'
     : '';
@@ -1253,7 +1478,7 @@ function page(items = [], errors = [], options = {}) {
 
   const adminBar = '<div class="admin-bar" id="admin-bar" data-admin-enabled="' + (adminEnabled ? '1' : '0') + '">'
     + '<div class="admin-copy"><strong>Admin</strong><span>'
-    + (adminEnabled ? 'Edit card names, logos, and visibility.' : 'Set ADMIN_TOKEN on the server to enable visual editing.')
+    + (adminEnabled ? 'Edit card names, URLs, logos, and visibility, or add new links.' : 'Set ADMIN_TOKEN on the server to enable visual editing.')
     + '</span></div>'
     + '<button type="button" class="btn" id="edit-toggle" aria-pressed="false" title="'
     + (adminEnabled ? 'Unlock visual editing' : 'Set ADMIN_TOKEN on the server to enable editing')
@@ -1291,9 +1516,11 @@ function page(items = [], errors = [], options = {}) {
     + '<div><h1>Web Directory</h1><p class="sub">' + subtitle + '</p></div>'
     + '</div>'
     + searchBar
+    + (adminEnabled ? '<button type="button" class="btn add-link" id="add-link" title="Add a new custom quick link">+ Add Custom Link</button>' : '')
     + '</header>'
     + adminBar
     + '<main class="grid" id="grid">' + body + '</main>'
+    + newCardTemplate
     + '<footer>Live from Coolify · applications, services &amp; manual links</footer>'
     + adminDialog
     + '<div id="toast" role="status" aria-live="polite"></div>'
