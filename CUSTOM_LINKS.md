@@ -7,8 +7,20 @@ The dashboard also includes a visual editor. Set `ADMIN_TOKEN` on the server, op
 ## File location
 
 - **Local development:** `./custom_links.json`, next to `server.js`.
-- **Docker Compose:** the project directory is mounted at `/app/data`, so the server reads and writes `/app/data/custom_links.json`. Changes made in the visual editor are persisted there. The data mount must be writable for **Save Changes** to work.
+- **Docker Compose:** the `app_data` named volume is mounted at `/app/data`. The image's `custom_links.json` seeds the volume on first start, and the server reads and writes `/app/data/custom_links.json`. Docker manages the volume's permissions, so this works even when the Coolify host directory is locked.
+- **Host-visible data (optional):** replace `app_data:/app/data:rw` with `./data:/app/data:rw` and make the dedicated `data/` directory writable by the container user. Do not bind-mount the whole project root; deployment platforms can make that directory read-only.
 - **Override:** set `DATA_DIR` to read the file from a different directory. It defaults to `/app/data` when `NODE_ENV=production`, otherwise to the project directory.
+
+The image creates `/app/data` with mode `777`, and `docker-entrypoint.sh` re-applies permissions at container startup. This second step matters because runtime mounts replace the directory permissions baked into the image. If a host mount is explicitly read-only, no `chmod` can fix it; use the named volume or make the mount writable.
+
+To inspect or back up the persisted JSON in the Compose deployment:
+
+```sh
+docker compose exec app ls -ld /app/data /app/data/custom_links.json
+docker compose exec app cat /app/data/custom_links.json
+```
+
+The named volume is runtime state, not the repository copy of `custom_links.json`. Use the command above if you want to export a snapshot to commit.
 
 ## Visual editor
 

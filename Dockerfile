@@ -19,13 +19,27 @@ RUN npm install --omit=dev
 # ---------------------------------------------------------------------------
 COPY server.js ./
 COPY custom_links.json ./data/
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 
 # ---------------------------------------------------------------------------
-# 3. Runtime configuration
+# 3. Ensure the data directory is writable
+# ---------------------------------------------------------------------------
+# Named volumes inherit this directory on first start. The entrypoint also
+# re-applies permissions at runtime because a bind mount can replace the
+# directory after the image is built.
+RUN mkdir -p /app/data \
+ && chmod 777 /app/data \
+ && chmod 666 /app/data/custom_links.json \
+ && sed -i 's/\r$//' /usr/local/bin/docker-entrypoint.sh \
+ && chmod 755 /usr/local/bin/docker-entrypoint.sh
+
+# ---------------------------------------------------------------------------
+# 4. Runtime configuration
 # ---------------------------------------------------------------------------
 # Credentials and the editor token are injected at runtime
 # (COOLIFY_INSTANCE_URL / COOLIFY_API_TOKEN / ADMIN_TOKEN).
 # Do not bake .env into the image.
 EXPOSE 3000
 ENV NODE_ENV=production
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 CMD ["node", "server.js"]

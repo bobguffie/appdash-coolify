@@ -9,8 +9,14 @@ services:
     env_file:
       - .env
     volumes:
-      - ./:/app/data
+      # Use a Docker-managed volume so the app never depends on ownership of
+      # a locked host directory. The image's custom_links.json seeds the
+      # volume on first start.
+      - app_data:/app/data:rw
     environment:
       - NODE_ENV=production
       - DATA_DIR=/app/data
     restart: unless-stopped
+
+volumes:
+  app_data:
