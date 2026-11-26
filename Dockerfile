@@ -23,7 +23,8 @@ COPY custom_links.json ./data/
 # ---------------------------------------------------------------------------
 # 3. Runtime configuration
 # ---------------------------------------------------------------------------
-# Credentials are injected at runtime (COOLIFY_INSTANCE_URL / COOLIFY_API_TOKEN).
+# Credentials and the editor token are injected at runtime
+# (COOLIFY_INSTANCE_URL / COOLIFY_API_TOKEN / ADMIN_TOKEN).
 # Do not bake .env into the image.
 EXPOSE 3000
 ENV NODE_ENV=production

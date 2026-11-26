@@ -11,6 +11,7 @@ const http = require('http');
 const https = require('https');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -255,38 +256,57 @@ function customLinksPath() {
   return path.join(dataDir, 'custom_links.json');
 }
 
-function loadCustomLinks() {
+function isTruthyFlag(value) {
+  return value === true || value === 1 || value === '1'
+    || String(value).toLowerCase() === 'true';
+}
+
+function customLinkEntries(parsed) {
+  if (Array.isArray(parsed)) return parsed;
+  if (parsed && Array.isArray(parsed.links)) return parsed.links;
+  if (parsed && parsed.links && typeof parsed.links === 'object') {
+    return Object.entries(parsed.links).map(([domain, value]) => {
+      if (typeof value === 'string') return { domain, name: value };
+      return { domain, ...(value || {}) };
+    });
+  }
+  if (parsed && typeof parsed === 'object' && (parsed.domain || parsed.url || parsed.link)) {
+    return [parsed];
+  }
+  if (parsed && typeof parsed === 'object') {
+    return Object.entries(parsed).map(([domain, value]) => {
+      if (typeof value === 'string') return { domain, name: value };
+      return { domain, ...(value || {}) };
+    });
+  }
+  return [];
+}
+
+function readCustomLinkEntries({ strict = false } = {}) {
   const filePath = customLinksPath();
-  let parsed;
+  let source;
   try {
-    parsed = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+    source = fs.readFileSync(filePath, 'utf8');
   } catch (err) {
-    if (err.code !== 'ENOENT') {
-      console.warn('Could not read ' + filePath + ': ' + err.message);
-    }
+    if (err.code === 'ENOENT') return [];
+    if (strict) throw err;
+    console.warn('Could not read ' + filePath + ': ' + err.message);
     return [];
   }
 
-  let entries = [];
-  if (Array.isArray(parsed)) {
-    entries = parsed;
-  } else if (parsed && Array.isArray(parsed.links)) {
-    entries = parsed.links;
-  } else if (parsed && typeof parsed.links === 'object' && parsed.links !== null) {
-    entries = Object.entries(parsed.links).map(([domain, value]) => {
-      if (typeof value === 'string') return { domain, name: value };
-      return { domain, ...(value || {}) };
-    });
-  } else if (parsed && typeof parsed === 'object' && (parsed.domain || parsed.url || parsed.link)) {
-    entries = [parsed];
-  } else if (parsed && typeof parsed === 'object') {
-    entries = Object.entries(parsed).map(([domain, value]) => {
-      if (typeof value === 'string') return { domain, name: value };
-      return { domain, ...(value || {}) };
-    });
+  try {
+    return customLinkEntries(JSON.parse(source));
+  } catch (err) {
+    if (strict) {
+      throw new Error('Existing custom_links.json is not valid JSON: ' + err.message);
+    }
+    console.warn('Could not parse ' + filePath + ': ' + err.message);
+    return [];
   }
+}
 
-  return entries
+function loadCustomLinks() {
+  return readCustomLinkEntries()
     .map(entry => {
       if (!entry || typeof entry !== 'object') return null;
 
@@ -297,6 +317,7 @@ function loadCustomLinks() {
       const name = String(providedName || domain || url).trim();
       const iconValue = entry.icon ?? entry.logo ?? entry.emoji ?? null;
       const icon = iconValue == null ? null : String(iconValue).trim();
+      const hide = isTruthyFlag(entry.hide);
 
       if (!url) return null;
       return {
@@ -304,8 +325,11 @@ function loadCustomLinks() {
         url,
         name: name || url,
         icon,
+        hide,
         hasUrl: Boolean(providedUrl),
         hasName: Boolean(providedName),
+        hasIcon: Boolean(icon),
+        hasHide: hide,
       };
     })
     .filter(Boolean);
@@ -317,7 +341,7 @@ function mergeItems(automated, custom) {
   for (const item of automated) {
     const key = domainKey(item.url);
     if (key && !merged.has(key)) {
-      merged.set(key, { ...item });
+      merged.set(key, { ...item, isHidden: false, hasCustomName: false, hasCustomIcon: false });
     }
   }
 
@@ -330,10 +354,15 @@ function mergeItems(automated, custom) {
       if (entry.hasName && entry.name) {
         existing.name = entry.name;
         existing.manualName = true;
+        existing.hasCustomName = true;
       }
       if (entry.hasUrl && entry.url) existing.url = entry.url;
-      if (entry.icon != null && entry.icon !== '') existing.icon = entry.icon;
-      existing.custom = true;
+      if (entry.icon != null && entry.icon !== '') {
+        existing.icon = entry.icon;
+        existing.hasCustomIcon = true;
+      }
+      if (entry.hasHide) existing.isHidden = true;
+      existing.custom = Boolean(entry.hasName || entry.hasUrl || entry.hasIcon || entry.hasHide);
     } else {
       merged.set(matchKey, {
         name: entry.name || entry.domain || entry.url,
@@ -343,12 +372,237 @@ function mergeItems(automated, custom) {
         icon: entry.icon,
         custom: true,
         manualName: true,
+        hasCustomName: Boolean(entry.hasName && entry.name),
+        hasCustomIcon: Boolean(entry.hasIcon || entry.icon),
+        isHidden: Boolean(entry.hasHide),
       });
     }
   }
 
   return [...merged.values()];
 }
+const MAX_LINK_UPDATES = 500;
+const MAX_NAME_LENGTH = 200;
+const MAX_ICON_LENGTH = 8192;
+const MAX_URL_LENGTH = 2048;
+
+class BadRequestError extends Error {}
+
+function adminEditingEnabled() {
+  return Boolean(String(process.env.ADMIN_TOKEN || '').trim());
+}
+
+function adminTokenFromRequest(req) {
+  const auth = String(req.get('authorization') || '');
+  const bearer = /^Bearer\s+(.+)$/i.exec(auth);
+  if (bearer) return bearer[1].trim();
+  return String(req.get('x-admin-token') || '').trim();
+}
+
+function tokensMatch(provided, expected) {
+  const left = Buffer.from(String(provided), 'utf8');
+  const right = Buffer.from(String(expected), 'utf8');
+  return left.length === right.length && crypto.timingSafeEqual(left, right);
+}
+
+function requireAdmin(req, res, next) {
+  const expected = String(process.env.ADMIN_TOKEN || '').trim();
+  if (!expected) {
+    return res.status(503).json({ error: 'Admin editing is disabled. Set ADMIN_TOKEN on the server.' });
+  }
+  const provided = adminTokenFromRequest(req);
+  if (!provided || !tokensMatch(provided, expected)) {
+    return res.status(401).json({ error: 'Invalid admin token.' });
+  }
+  return next();
+}
+
+function hasOwn(object, key) {
+  return Object.prototype.hasOwnProperty.call(object, key);
+}
+
+function cleanTextField(value, maxLength, label) {
+  if (value == null) return '';
+  if (typeof value !== 'string' && typeof value !== 'number') {
+    throw new BadRequestError(label + ' must be text.');
+  }
+  const text = String(value).trim();
+  if (text.length > maxLength) {
+    throw new BadRequestError(label + ' is too long.');
+  }
+  if (/[\u0000-\u0008\u000a-\u000c\u000e-\u001f]/.test(text)) {
+    throw new BadRequestError(label + ' contains invalid control characters.');
+  }
+  return text;
+}
+
+function linkUpdatesFromBody(body) {
+  if (Array.isArray(body)) return body;
+  if (!body || typeof body !== 'object') {
+    throw new BadRequestError('Request body must be a JSON object.');
+  }
+  if (Array.isArray(body.links)) return body.links;
+  if (body.links && typeof body.links === 'object') {
+    return Object.entries(body.links).map(([domain, value]) => {
+      if (typeof value === 'string') return { domain, name: value };
+      return { domain, ...(value && typeof value === 'object' ? value : {}) };
+    });
+  }
+  if (body.domain || body.host || body.url) return [body];
+  throw new BadRequestError('Request body must include a links array.');
+}
+
+function normalizeLinkUpdate(raw, index) {
+  const label = 'links[' + index + ']';
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new BadRequestError(label + ' must be an object.');
+  }
+
+  const rawDomain = raw.domain || raw.host || raw.url || raw.link;
+  if (!rawDomain || !looksLikeDomain(String(rawDomain))) {
+    throw new BadRequestError(label + '.domain must be a valid hostname.');
+  }
+  const key = domainKey(rawDomain);
+  if (!key) throw new BadRequestError(label + '.domain must be a valid hostname.');
+
+  const update = { key, domain: key };
+
+  if (hasOwn(raw, 'name') || hasOwn(raw, 'title')) {
+    update.hasName = true;
+    update.name = cleanTextField(raw.name ?? raw.title, MAX_NAME_LENGTH, label + '.name');
+  }
+
+  if (hasOwn(raw, 'icon') || hasOwn(raw, 'logo') || hasOwn(raw, 'emoji')) {
+    update.hasIcon = true;
+    update.icon = cleanTextField(raw.icon ?? raw.logo ?? raw.emoji, MAX_ICON_LENGTH, label + '.icon');
+  }
+
+  if (hasOwn(raw, 'url') || hasOwn(raw, 'link')) {
+    update.hasUrl = true;
+    const rawUrl = cleanTextField(raw.url ?? raw.link, MAX_URL_LENGTH, label + '.url');
+    if (rawUrl) {
+      const url = normalizeUrl(rawUrl);
+      let parsed;
+      try { parsed = new URL(url); } catch { parsed = null; }
+      if (!parsed || !/^https?:$/i.test(parsed.protocol)) {
+        throw new BadRequestError(label + '.url must be an http(s) URL.');
+      }
+      update.url = url;
+    } else {
+      update.url = '';
+    }
+  }
+
+  if (hasOwn(raw, 'hide')) {
+    update.hasHide = true;
+    const hide = raw.hide;
+    if (hide === true || hide === 1 || hide === '1' || String(hide).toLowerCase() === 'true') {
+      update.hide = true;
+    } else if (hide === false || hide === 0 || hide === '0' || hide == null || String(hide).toLowerCase() === 'false') {
+      update.hide = false;
+    } else {
+      throw new BadRequestError(label + '.hide must be true or false.');
+    }
+  }
+
+  if (!update.hasName && !update.hasIcon && !update.hasUrl && !update.hasHide) {
+    throw new BadRequestError(label + ' must include at least one of name, icon, url, or hide.');
+  }
+
+  return update;
+}
+
+function saveCustomLinkUpdates(updates) {
+  const existing = readCustomLinkEntries({ strict: true });
+  const byKey = new Map();
+  const entries = [];
+
+  for (const entry of existing) {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) continue;
+    const rawDomain = entry.domain || entry.host || entry.link || entry.url || '';
+    const key = domainKey(rawDomain);
+    if (!key) continue;
+    const copy = { ...entry };
+    if (!copy.domain) copy.domain = key;
+    entries.push(copy);
+    if (!byKey.has(key)) byKey.set(key, copy);
+  }
+
+  let updated = 0;
+  for (const update of updates) {
+    const existingEntry = byKey.get(update.key);
+    const created = !existingEntry;
+    const entry = existingEntry || { domain: update.domain };
+
+    if (update.hasName) {
+      if (update.name) {
+        entry.name = update.name;
+        delete entry.title;
+      } else {
+        delete entry.name;
+        delete entry.title;
+      }
+    }
+    if (update.hasIcon) {
+      if (update.icon) {
+        entry.icon = update.icon;
+        delete entry.logo;
+        delete entry.emoji;
+      } else {
+        delete entry.icon;
+        delete entry.logo;
+        delete entry.emoji;
+      }
+    }
+    if (update.hasUrl) {
+      if (update.url) {
+        entry.url = update.url;
+        delete entry.link;
+      } else {
+        delete entry.url;
+        delete entry.link;
+      }
+    }
+    if (update.hasHide) {
+      if (update.hide) entry.hide = true;
+      else delete entry.hide;
+    }
+
+    if (created) {
+      const meaningful = Boolean(entry.name || entry.title || entry.url || entry.link
+        || entry.icon || entry.logo || entry.emoji || entry.hide === true);
+      if (!meaningful) continue;
+      byKey.set(update.key, entry);
+      entries.push(entry);
+    }
+    updated += 1;
+  }
+
+  const filePath = customLinksPath();
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  fs.writeFileSync(filePath, JSON.stringify({ links: entries }, null, 2) + '\n', 'utf8');
+  return { updated, links: entries.length };
+}
+
+function handleCustomLinksSave(req, res) {
+  try {
+    const rawUpdates = linkUpdatesFromBody(req.body);
+    if (rawUpdates.length > MAX_LINK_UPDATES) {
+      throw new BadRequestError('Too many link updates in one request.');
+    }
+    const updates = rawUpdates.map(normalizeLinkUpdate);
+    const result = saveCustomLinkUpdates(updates);
+    return res.json({ ok: true, updated: result.updated, links: result.links });
+  } catch (err) {
+    if (err instanceof BadRequestError) {
+      return res.status(400).json({ error: err.message });
+    }
+    console.error('Could not save custom links:', err);
+    return res.status(500).json({ error: 'Could not save custom links. Check that DATA_DIR is writable.' });
+  }
+}
+
+
 const STYLE = `
 *,*::before,*::after{box-sizing:border-box}
   :root{
@@ -459,6 +713,92 @@ const STYLE = `
   .manual-badge{flex:none;font-size:9.5px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:#93c5fd;background:rgba(59,130,246,.14);box-shadow:inset 0 0 0 1px rgba(59,130,246,.25);padding:3px 6px;border-radius:5px}
   .avatar .custom-icon{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;padding:10px;background:transparent}
   .avatar .emoji{font-size:34px;line-height:1;position:relative;z-index:1}
+  .card-wrap{display:flex;flex-direction:column;min-width:0}
+  .card-wrap .card{width:100%}
+  .card-wrap.is-hidden{display:none}
+  .card-wrap.filtered{display:none!important}
+  body.editing .card-wrap.is-hidden{display:flex}
+  body.editing .card-wrap.is-hidden .card{opacity:.52;border-style:dashed;filter:grayscale(.5)}
+  body.editing .card{pointer-events:none}
+  body.editing .card .arrow{display:none}
+  .hidden-flag{display:none;flex:none;font-size:9.5px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:#fbbf24;background:rgba(251,191,36,.12);box-shadow:inset 0 0 0 1px rgba(251,191,36,.26);padding:3px 6px;border-radius:5px}
+  .card-wrap.is-hidden .hidden-flag{display:inline-flex}
+
+  .admin-bar{display:flex;align-items:center;justify-content:space-between;gap:14px;flex-wrap:wrap;
+    padding:13px 16px;margin:-18px 0 22px;border-radius:13px;border:1px solid var(--line);
+    background:rgba(255,255,255,.025)}
+  .admin-bar[data-admin-enabled="0"]{opacity:.84}
+  .admin-copy{display:flex;align-items:baseline;gap:9px;flex-wrap:wrap;color:var(--muted);font-size:12.5px}
+  .admin-copy strong{color:#c3c8db;font-size:13px;letter-spacing:-.01em}
+  .admin-actions{display:none;align-items:center;gap:9px;flex-wrap:wrap;margin-left:auto}
+  body.editing .admin-actions{display:flex}
+  .btn{appearance:none;border:1px solid var(--line);background:rgba(255,255,255,.045);
+    color:var(--text);border-radius:9px;padding:8px 13px;font:inherit;font-size:12.5px;font-weight:600;
+    cursor:pointer;transition:border-color .16s,background .16s,color .16s,opacity .16s}
+  .btn:hover{border-color:var(--line-hi);background:rgba(255,255,255,.075)}
+  .btn:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+  .btn.primary{color:#fff;border-color:rgba(129,140,248,.55);background:linear-gradient(135deg,#6366f1,#8b5cf6);
+    box-shadow:0 8px 18px -12px rgba(99,102,241,.9)}
+  .btn.primary:hover{background:linear-gradient(135deg,#7377f5,#9a6ef8)}
+  .btn.ghost{color:var(--muted);background:transparent}
+  .btn[disabled]{opacity:.45;cursor:not-allowed;transform:none}
+  .edit-status{font-size:12px;color:var(--muted);min-width:112px;text-align:right}
+  body.has-edits .edit-status{color:#fbbf24}
+
+  .editor{display:none;margin-top:10px;padding:14px 15px 15px;border-radius:13px;
+    border:1px solid rgba(129,140,248,.18);background:rgba(9,12,20,.72)}
+  body.editing .editor{display:block}
+  .editor-top{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:10px}
+  .editor-kicker{font-size:10px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:#737b94}
+  .hide-btn{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--line);
+    background:rgba(255,255,255,.04);color:#c3c8db;border-radius:7px;padding:5px 9px;
+    font:inherit;font-size:11.5px;font-weight:600;cursor:pointer}
+  .hide-btn:hover{border-color:var(--line-hi);background:rgba(255,255,255,.07)}
+  .hide-btn svg{width:14px;height:14px}
+  .hide-btn .eye-off{display:none}
+  .hide-btn.is-off{color:#fbbf24;border-color:rgba(251,191,36,.34);background:rgba(251,191,36,.09)}
+  .hide-btn.is-off .eye-open{display:none}
+  .hide-btn.is-off .eye-off{display:inline}
+  .editor-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+  .field{display:flex;flex-direction:column;gap:5px;min-width:0}
+  .field span{font-size:10.5px;font-weight:600;letter-spacing:.045em;text-transform:uppercase;color:#737b94}
+  .field input{width:100%;padding:8px 10px;border-radius:8px;border:1px solid var(--line);
+    background:rgba(255,255,255,.035);color:var(--text);font:inherit;font-size:13px;outline:none}
+  .field input::placeholder{color:#5f6780}
+  .field input:focus{border-color:var(--line-hi);background:rgba(255,255,255,.06)}
+  .card-wrap.dirty .card{border-color:rgba(251,191,36,.55)}
+  .card-wrap.dirty .editor{box-shadow:inset 0 0 0 1px rgba(251,191,36,.16)}
+
+  #toast{position:fixed;left:50%;bottom:24px;transform:translate(-50%,18px);z-index:40;
+    max-width:min(520px,calc(100vw - 32px));padding:11px 16px;border-radius:10px;
+    border:1px solid var(--line);background:#171b27;color:var(--text);font-size:13px;
+    box-shadow:0 18px 40px -18px rgba(0,0,0,.9);opacity:0;pointer-events:none;
+    transition:opacity .18s,transform .18s}
+  #toast.on{opacity:1;transform:translate(-50%,0)}
+  #toast.error{border-color:rgba(248,113,113,.4);color:#fecaca;background:#25161a}
+  #toast.ok{border-color:rgba(74,222,128,.35);color:#bbf7d0;background:#122019}
+
+  dialog.modal:not([open]){display:none}
+  dialog.modal{border:1px solid var(--line);border-radius:16px;padding:0;background:var(--card);
+    color:var(--text);width:min(430px,calc(100vw - 32px));box-shadow:0 30px 80px -28px rgba(0,0,0,.95)}
+  dialog.modal::backdrop{background:rgba(3,5,10,.74);backdrop-filter:blur(4px)}
+  .modal-body{padding:22px}
+  .modal-body h2{margin:0 0 6px;font-size:17px;letter-spacing:-.02em}
+  .modal-body p{margin:0 0 15px;color:var(--muted);font-size:12.5px;line-height:1.5}
+  .modal-body input{width:100%;padding:10px 11px;border-radius:9px;border:1px solid var(--line);
+    background:rgba(255,255,255,.035);color:var(--text);font:inherit;font-size:13.5px;outline:none}
+  .modal-body input:focus{border-color:var(--line-hi);background:rgba(255,255,255,.06)}
+  .modal-error{min-height:17px;margin-top:7px;color:#fca5a5;font-size:12px}
+  .modal-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:12px}
+  body.editing .empty.all-hidden{display:none}
+
+  @media (max-width:760px){
+    .admin-bar{margin-top:-8px}
+    .admin-actions{width:100%;margin-left:0}
+    .edit-status{text-align:left;margin-right:auto}
+    .editor-grid{grid-template-columns:1fr}
+  }
+
 `;
 
 function cardHtml(item) {
@@ -468,17 +808,28 @@ function cardHtml(item) {
   const st = statusInfo(item.status);
   const hay = (name + ' ' + host + ' ' + (item.source || '')).toLowerCase();
   const customIcon = customIconHtml(item);
+  const iconValue = item.icon == null ? '' : String(item.icon);
+  const isHidden = Boolean(item.isHidden);
   const avatarContent = customIcon || (
     '<span class="inits">' + esc(initials(name)) + '</span>'
     + '<img class="logo" alt="" referrerpolicy="no-referrer" data-srcs="' + esc(logoSources(item)) + '">'
   );
   const manualBadge = item.custom ? '<span class="manual-badge">Manual</span>' : '';
+  const hiddenBadge = '<span class="hidden-flag">Hidden</span>';
 
-  return '<a class="card" href="' + esc(url) + '" target="_blank" rel="noopener"'
-    + ' data-hay="' + esc(hay) + '" title="' + esc(host) + '">'
+  return '<div class="card-wrap' + (isHidden ? ' is-hidden' : '') + '"'
+    + ' data-domain="' + esc(host) + '"'
+    + ' data-name="' + esc(name) + '"'
+    + ' data-icon="' + esc(iconValue) + '"'
+    + ' data-hidden="' + (isHidden ? '1' : '0') + '"'
+    + ' data-original-hidden="' + (isHidden ? '1' : '0') + '"'
+    + ' data-has-name="' + (item.hasCustomName ? '1' : '0') + '"'
+    + ' data-has-icon="' + (item.icon ? '1' : '0') + '"'
+    + ' data-hay="' + esc(hay) + '">'
+    + '<a class="card" href="' + esc(url) + '" target="_blank" rel="noopener" title="' + esc(host) + '">'
     + '<span class="avatar" style="background:' + gradientFor(name) + '">' + avatarContent + '</span>'
     + '<span class="body">'
-    + '<span class="name-row"><span class="name">' + esc(name) + '</span>' + manualBadge + '</span>'
+    + '<span class="name-row"><span class="name">' + esc(name) + '</span>' + manualBadge + hiddenBadge + '</span>'
     + '<span class="host">' + esc(host) + '</span>'
     + '</span>'
     + '<span class="tail">'
@@ -487,26 +838,442 @@ function cardHtml(item) {
     + '<path d="M6 3h7v7M13 3 4.5 11.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>'
     + '</svg>'
     + '</span>'
-    + '</a>';
+    + '</a>'
+    + '<div class="editor" aria-label="Edit settings for ' + esc(name) + '">'
+    + '<div class="editor-top"><span class="editor-kicker">Card settings</span>'
+    + '<button type="button" class="hide-btn' + (isHidden ? ' is-off' : '') + '" data-hide'
+    + ' aria-pressed="' + (isHidden ? 'true' : 'false') + '" title="' + (isHidden ? 'Show this card' : 'Hide this card') + '">'
+    + '<svg class="eye-open" viewBox="0 0 16 16" fill="none" aria-hidden="true">'
+    + '<path d="M1.5 8s2.4-4.3 6.5-4.3S14.5 8 14.5 8s-2.4 4.3-6.5 4.3S1.5 8 1.5 8Z" stroke="currentColor" stroke-width="1.35"/>'
+    + '<circle cx="8" cy="8" r="2" stroke="currentColor" stroke-width="1.35"/>'
+    + '</svg>'
+    + '<svg class="eye-off" viewBox="0 0 16 16" fill="none" aria-hidden="true">'
+    + '<path d="m2 2 12 12M6.3 4.1A6.9 6.9 0 0 1 8 3.7c4.1 0 6.5 4.3 6.5 4.3a11.4 11.4 0 0 1-2.1 2.5M9.7 11.9A6.9 6.9 0 0 1 8 12.3C3.9 12.3 1.5 8 1.5 8a11.4 11.4 0 0 1 2.1-2.5" stroke="currentColor" stroke-width="1.35" stroke-linecap="round"/>'
+    + '</svg>'
+    + '<span data-hide-label>' + (isHidden ? 'Show' : 'Hide') + '</span></button>'
+    + '</div>'
+    + '<div class="editor-grid">'
+    + '<label class="field"><span>Name</span><input type="text" data-field="name" value="' + esc(name) + '" maxlength="200" autocomplete="off" spellcheck="false" placeholder="Card name"></label>'
+    + '<label class="field"><span>Emoji or logo URL</span><input type="text" data-field="icon" value="' + esc(iconValue) + '" maxlength="8192" autocomplete="off" spellcheck="false" placeholder="🚀 or https://…"></label>'
+    + '</div>'
+    + '</div>'
+    + '</div>';
 }
 
-function page(items = [], errors = []) {
+const CLIENT_SCRIPT = String.raw`
+(function(){
+  'use strict';
+  var body = document.body;
+  var bar = document.getElementById('admin-bar');
+  var adminEnabled = Boolean(bar && bar.getAttribute('data-admin-enabled') === '1');
+  var editToggle = document.getElementById('edit-toggle');
+  var saveButton = document.getElementById('save-links');
+  var discardButton = document.getElementById('cancel-edits');
+  var statusEl = document.getElementById('edit-status');
+  var dialog = document.getElementById('admin-dialog');
+  var form = document.getElementById('admin-form');
+  var tokenInput = document.getElementById('admin-token');
+  var adminError = document.getElementById('admin-error');
+  var adminCancel = document.getElementById('admin-cancel');
+  var toastEl = document.getElementById('toast');
+  var adminToken = '';
+  var toastTimer = null;
+  var allowLeave = false;
+
+  function showToast(message, tone) {
+    if (!toastEl) return;
+    toastEl.textContent = message;
+    toastEl.className = 'on' + (tone ? ' ' + tone : '');
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(function(){ toastEl.className = ''; }, tone === 'error' ? 6000 : 3500);
+  }
+
+  function initialsFor(name) {
+    var words = String(name || '').trim().split(/\s+/).filter(Boolean);
+    if (!words.length) return '?';
+    if (words.length === 1) return words[0].slice(0, 2).toUpperCase();
+    return (words[0].charAt(0) + words[1].charAt(0)).toUpperCase();
+  }
+
+  function initLogos(root) {
+    (root || document).querySelectorAll('img.logo').forEach(function(img){
+      if (img.getAttribute('data-bound') === '1') return;
+      img.setAttribute('data-bound', '1');
+      var list = (img.getAttribute('data-srcs') || '').split('|').filter(Boolean);
+      function next() {
+        if (!list.length) {
+          if (img.parentNode) img.parentNode.removeChild(img);
+          return;
+        }
+        img.src = list.shift();
+      }
+      img.addEventListener('load', function(){ img.classList.add('on'); });
+      img.addEventListener('error', next);
+      next();
+    });
+  }
+
+  function changeFor(wrap) {
+    var nameInput = wrap.querySelector('[data-field="name"]');
+    var iconInput = wrap.querySelector('[data-field="icon"]');
+    if (!nameInput || !iconInput) return null;
+
+    var originalName = wrap.getAttribute('data-name') || '';
+    var originalIcon = wrap.getAttribute('data-icon') || '';
+    var hasName = wrap.getAttribute('data-has-name') === '1';
+    var hasIcon = wrap.getAttribute('data-has-icon') === '1';
+    var hidden = wrap.getAttribute('data-hidden') === '1';
+    var originalHidden = wrap.getAttribute('data-original-hidden') === '1';
+    var nameValue = nameInput.value.trim();
+    var iconValue = iconInput.value.trim();
+    var entry = null;
+
+    function ensure() {
+      if (!entry) entry = { domain: wrap.getAttribute('data-domain') || '' };
+    }
+
+    if (nameValue !== originalName) {
+      if (nameValue || hasName) {
+        ensure();
+        entry.name = nameValue;
+      }
+    }
+    if (iconValue !== originalIcon) {
+      if (iconValue || hasIcon) {
+        ensure();
+        entry.icon = iconValue;
+      }
+    }
+    if (hidden !== originalHidden) {
+      ensure();
+      entry.hide = hidden;
+    }
+    return entry;
+  }
+
+  function collectChanges() {
+    var changes = [];
+    document.querySelectorAll('.card-wrap').forEach(function(wrap){
+      var change = changeFor(wrap);
+      if (change) changes.push(change);
+    });
+    return changes;
+  }
+
+  function updateDirty() {
+    var changes = collectChanges();
+    body.classList.toggle('has-edits', changes.length > 0);
+    document.querySelectorAll('.card-wrap').forEach(function(wrap){
+      wrap.classList.toggle('dirty', Boolean(changeFor(wrap)));
+    });
+    if (statusEl) {
+      statusEl.textContent = changes.length
+        ? changes.length + (changes.length === 1 ? ' unsaved change' : ' unsaved changes')
+        : 'No unsaved changes';
+    }
+    if (saveButton) saveButton.disabled = changes.length === 0;
+    return changes;
+  }
+
+  function previewName(wrap) {
+    var input = wrap.querySelector('[data-field="name"]');
+    var nameEl = wrap.querySelector('.name');
+    if (!input || !nameEl) return;
+    var value = input.value.trim();
+    nameEl.textContent = value || wrap.getAttribute('data-domain') || '';
+    var hay = (value + ' ' + (wrap.getAttribute('data-domain') || '')).toLowerCase();
+    wrap.setAttribute('data-hay', hay);
+  }
+
+  function previewIcon(wrap) {
+    var input = wrap.querySelector('[data-field="icon"]');
+    var avatar = wrap.querySelector('.avatar');
+    if (!input || !avatar) return;
+    if (!avatar.getAttribute('data-original-html')) {
+      avatar.setAttribute('data-original-html', avatar.innerHTML);
+    }
+    var original = avatar.getAttribute('data-original-html');
+    var value = input.value.trim();
+    avatar.innerHTML = '';
+
+    if (!value) {
+      if (wrap.getAttribute('data-has-icon') === '1') {
+        var nameInput = wrap.querySelector('[data-field="name"]');
+        var fallbackName = (nameInput && nameInput.value.trim()) || wrap.getAttribute('data-name');
+        avatar.innerHTML = '<span class="inits">' + initialsFor(fallbackName) + '</span>';
+      } else {
+        avatar.innerHTML = original;
+        initLogos(avatar);
+      }
+      return;
+    }
+
+    if (/^(https?:\/\/|data:image\/)/i.test(value)) {
+      var img = document.createElement('img');
+      img.className = 'custom-icon';
+      img.alt = '';
+      img.referrerPolicy = 'no-referrer';
+      img.loading = 'lazy';
+      img.src = value;
+      img.addEventListener('error', function(){
+        if (img.parentNode) img.parentNode.removeChild(img);
+        avatar.innerHTML = original;
+        initLogos(avatar);
+      });
+      avatar.appendChild(img);
+    } else {
+      var span = document.createElement('span');
+      span.className = 'emoji';
+      span.setAttribute('aria-hidden', 'true');
+      span.textContent = value;
+      avatar.appendChild(span);
+    }
+  }
+
+  function enterEditMode() {
+    if (!adminEnabled) {
+      showToast('Admin editing is disabled. Set ADMIN_TOKEN on the server.', 'error');
+      return;
+    }
+    body.classList.add('editing');
+    if (editToggle) {
+      editToggle.setAttribute('aria-pressed', 'true');
+      editToggle.textContent = 'Exit Edit Mode';
+    }
+    updateDirty();
+  }
+
+  function exitEditMode() {
+    var changes = collectChanges();
+    if (changes.length && !window.confirm('Discard unsaved changes?')) return;
+    if (changes.length) {
+      allowLeave = true;
+      window.location.reload();
+      return;
+    }
+    body.classList.remove('editing');
+    body.classList.remove('has-edits');
+    adminToken = '';
+    if (editToggle) {
+      editToggle.setAttribute('aria-pressed', 'false');
+      editToggle.textContent = 'Admin Edit Mode';
+    }
+    updateDirty();
+  }
+
+  function saveChanges() {
+    var changes = updateDirty();
+    if (!changes.length) {
+      showToast('No changes to save.', 'info');
+      return;
+    }
+    if (!adminToken) {
+      openDialog();
+      return;
+    }
+    if (!saveButton) return;
+    var oldLabel = saveButton.textContent;
+    saveButton.disabled = true;
+    saveButton.textContent = 'Saving…';
+
+    fetch('/api/v1/custom-links', {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer ' + adminToken
+      },
+      body: JSON.stringify({ links: changes }),
+      cache: 'no-store'
+    }).then(function(response){
+      return response.json().catch(function(){ return {}; }).then(function(data){
+        if (!response.ok) {
+          var error = new Error(data.error || ('Save failed (' + response.status + ')'));
+          error.status = response.status;
+          throw error;
+        }
+        return data;
+      });
+    }).then(function(data){
+      allowLeave = true;
+      adminToken = '';
+      body.classList.remove('editing');
+      showToast('Saved ' + (data.updated || changes.length) + ' change' + ((data.updated || changes.length) === 1 ? '' : 's') + '. Reloading…', 'ok');
+      setTimeout(function(){ window.location.reload(); }, 350);
+    }).catch(function(error){
+      saveButton.disabled = false;
+      saveButton.textContent = oldLabel;
+      if (error.status === 401) {
+        adminToken = '';
+        showToast('Admin token was rejected. Enter it again.', 'error');
+        openDialog();
+      } else {
+        showToast(error.message || 'Could not save changes.', 'error');
+      }
+    });
+  }
+
+  function openDialog() {
+    if (!dialog || dialog.open) return;
+    if (adminError) adminError.textContent = '';
+    if (tokenInput) tokenInput.value = '';
+    if (typeof dialog.showModal === 'function') dialog.showModal();
+    else dialog.setAttribute('open', '');
+    setTimeout(function(){ if (tokenInput) tokenInput.focus(); }, 30);
+  }
+
+  function closeDialog() {
+    if (!dialog) return;
+    if (typeof dialog.close === 'function') dialog.close();
+    else dialog.removeAttribute('open');
+  }
+
+  if (form) {
+    form.addEventListener('submit', function(event){
+      event.preventDefault();
+      var value = tokenInput ? tokenInput.value.trim() : '';
+      if (!value) {
+        if (adminError) adminError.textContent = 'Enter the admin token to continue.';
+        if (tokenInput) tokenInput.focus();
+        return;
+      }
+      adminToken = value;
+      if (adminError) adminError.textContent = '';
+      closeDialog();
+      enterEditMode();
+    });
+  }
+
+  if (adminCancel) {
+    adminCancel.addEventListener('click', function(){
+      if (adminError) adminError.textContent = '';
+      closeDialog();
+    });
+  }
+
+  if (editToggle) {
+    editToggle.addEventListener('click', function(){
+      if (body.classList.contains('editing')) exitEditMode();
+      else if (!adminEnabled) showToast('Admin editing is disabled. Set ADMIN_TOKEN on the server.', 'error');
+      else if (!adminToken) openDialog();
+      else enterEditMode();
+    });
+  }
+
+  if (saveButton) saveButton.addEventListener('click', saveChanges);
+
+  if (discardButton) {
+    discardButton.addEventListener('click', function(){
+      var changes = collectChanges();
+      if (!changes.length) {
+        exitEditMode();
+        return;
+      }
+      if (!window.confirm('Discard unsaved changes?')) return;
+      allowLeave = true;
+      window.location.reload();
+    });
+  }
+
+  document.addEventListener('input', function(event){
+    var input = event.target;
+    if (!input || !input.getAttribute || !input.getAttribute('data-field')) return;
+    var wrap = input.closest('.card-wrap');
+    if (!wrap) return;
+    if (input.getAttribute('data-field') === 'name') previewName(wrap);
+    if (input.getAttribute('data-field') === 'icon') previewIcon(wrap);
+    updateDirty();
+  });
+
+  document.addEventListener('click', function(event){
+    var button = event.target && event.target.closest ? event.target.closest('[data-hide]') : null;
+    if (!button) return;
+    var wrap = button.closest('.card-wrap');
+    if (!wrap) return;
+    event.preventDefault();
+    var hidden = wrap.getAttribute('data-hidden') !== '1';
+    wrap.setAttribute('data-hidden', hidden ? '1' : '0');
+    wrap.classList.toggle('is-hidden', hidden);
+    button.classList.toggle('is-off', hidden);
+    button.setAttribute('aria-pressed', hidden ? 'true' : 'false');
+    button.setAttribute('title', hidden ? 'Show this card' : 'Hide this card');
+    var label = button.querySelector('[data-hide-label]');
+    if (label) label.textContent = hidden ? 'Show' : 'Hide';
+    updateDirty();
+  });
+
+  window.addEventListener('beforeunload', function(event){
+    if (allowLeave || !body.classList.contains('editing')) return;
+    if (!collectChanges().length) return;
+    event.preventDefault();
+    event.returnValue = '';
+  });
+
+  document.querySelectorAll('.card-wrap .avatar').forEach(function(avatar){
+    avatar.setAttribute('data-original-html', avatar.innerHTML);
+  });
+  initLogos(document);
+
+  var q = document.getElementById('q');
+  if (q) {
+    q.addEventListener('input', function(){
+      var value = q.value.trim().toLowerCase();
+      document.querySelectorAll('.card-wrap').forEach(function(card){
+        var show = !value || (card.getAttribute('data-hay') || '').indexOf(value) > -1;
+        card.classList.toggle('filtered', !show);
+      });
+    });
+  }
+})();
+`;
+
+function page(items = [], errors = [], options = {}) {
+  const adminEnabled = Boolean(options.adminEnabled);
+  const visibleCount = items.filter(item => !item.isHidden).length;
   const cards = items.map(cardHtml).join('');
   const warning = errors.length
     ? '<div class="notice"><strong>Coolify API warning</strong><span>' + errors.map(esc).join(' · ') + '</span></div>'
     : '';
+  const hiddenHelp = adminEnabled
+    ? 'Enable Admin Edit Mode to restore them.'
+    : 'Set ADMIN_TOKEN on the server, then enable Admin Edit Mode to restore them.';
   const empty = items.length === 0
     ? '<div class="empty"><strong>No applications or links found</strong>Deploy something in Coolify or add an entry to custom_links.json.</div>'
-    : '';
+    : visibleCount === 0
+      ? '<div class="empty all-hidden"><strong>All cards are hidden</strong>' + hiddenHelp + '</div>'
+      : '';
   const body = warning + cards + empty;
 
-  const searchBar = !items.length ? '' :
+  const searchBar = !visibleCount ? '' :
     '<div class="search">'
     + '<svg viewBox="0 0 16 16" fill="none" aria-hidden="true"><circle cx="7" cy="7" r="4.6" stroke="currentColor" stroke-width="1.5"/><path d="m10.6 10.6 2.9 2.9" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>'
     + '<input id="q" type="search" placeholder="Filter apps &amp; links" autocomplete="off" aria-label="Filter applications and links">'
     + '</div>';
 
-  const subtitle = '<b>' + items.length + '</b> ' + (items.length === 1 ? 'app or link' : 'apps &amp; links') + (errors.length ? ' · API warning' : ' live');
+  const subtitle = '<b>' + visibleCount + '</b> ' + (visibleCount === 1 ? 'app or link' : 'apps &amp; links') + (errors.length ? ' · API warning' : ' live');
+
+  const adminBar = '<div class="admin-bar" id="admin-bar" data-admin-enabled="' + (adminEnabled ? '1' : '0') + '">'
+    + '<div class="admin-copy"><strong>Admin</strong><span>'
+    + (adminEnabled ? 'Edit card names, logos, and visibility.' : 'Set ADMIN_TOKEN on the server to enable visual editing.')
+    + '</span></div>'
+    + '<button type="button" class="btn" id="edit-toggle" aria-pressed="false" title="'
+    + (adminEnabled ? 'Unlock visual editing' : 'Set ADMIN_TOKEN on the server to enable editing')
+    + '">Admin Edit Mode</button>'
+    + '<div class="admin-actions">'
+    + '<span class="edit-status" id="edit-status">No unsaved changes</span>'
+    + '<button type="button" class="btn primary" id="save-links" disabled>Save Changes</button>'
+    + '<button type="button" class="btn ghost" id="cancel-edits">Discard</button>'
+    + '</div></div>';
+
+  const adminDialog = '<dialog class="modal" id="admin-dialog">'
+    + '<form class="modal-body" id="admin-form">'
+    + '<h2>Unlock Admin Editor</h2>'
+    + '<p>Enter the <code>ADMIN_TOKEN</code> configured on the server. It stays in memory for this page only.</p>'
+    + '<input type="password" id="admin-token" autocomplete="off" spellcheck="false" placeholder="Admin token" aria-label="Admin token">'
+    + '<div class="modal-error" id="admin-error"></div>'
+    + '<div class="modal-actions">'
+    + '<button type="button" class="btn ghost" id="admin-cancel">Cancel</button>'
+    + '<button type="submit" class="btn primary">Unlock Editor</button>'
+    + '</div></form></dialog>';
 
   return '<!DOCTYPE html>\n<html lang="en">\n<head>'
     + '<meta charset="UTF-8">'
@@ -525,23 +1292,13 @@ function page(items = [], errors = []) {
     + '</div>'
     + searchBar
     + '</header>'
+    + adminBar
     + '<main class="grid" id="grid">' + body + '</main>'
     + '<footer>Live from Coolify · applications, services &amp; manual links</footer>'
+    + adminDialog
+    + '<div id="toast" role="status" aria-live="polite"></div>'
     + '</div>'
-    + '<script>'
-    + 'document.querySelectorAll("img.logo").forEach(function(img){'
-    + 'var list=(img.dataset.srcs||"").split("|").filter(Boolean);'
-    + 'function next(){if(!list.length){img.parentNode.removeChild(img);return;}img.src=list.shift();}'
-    + 'img.addEventListener("load",function(){img.classList.add("on");});'
-    + 'img.addEventListener("error",next);'
-    + 'next();});'
-    + 'var q=document.getElementById("q");'
-    + 'if(q){q.addEventListener("input",function(){'
-    + 'var v=q.value.trim().toLowerCase(),n=0;'
-    + 'document.querySelectorAll(".card").forEach(function(c){'
-    + 'var show=!v||c.dataset.hay.indexOf(v)>-1;'
-    + 'c.classList.toggle("hidden",!show);if(show)n++;});});}'
-    + '</script>'
+    + '<script>' + CLIENT_SCRIPT + '</script>'
     + '</body></html>';
 }
 function fetchCoolifyJson(url, token, redirects = 0) {
@@ -602,12 +1359,18 @@ function buildCoolifyUrl(instanceUrl, pathname) {
   return instanceUrl.replace(/\/+$/, '') + pathname;
 }
 
+const saveLinkBody = express.json({ limit: '256kb', type: 'application/json' });
+app.post('/api/v1/custom-links', requireAdmin, saveLinkBody, handleCustomLinksSave);
+app.put('/api/v1/custom-links', requireAdmin, saveLinkBody, handleCustomLinksSave);
+
 app.get('/', async (req, res) => {
   const base = String(process.env.COOLIFY_INSTANCE_URL || '').trim().replace(/\/+$/, '');
   const token = String(process.env.COOLIFY_API_TOKEN || '').trim();
 
   if (!base || !token) {
-    return res.status(500).send(page([], ['COOLIFY_INSTANCE_URL and COOLIFY_API_TOKEN must be set']));
+    return res.status(500).send(page([], ['COOLIFY_INSTANCE_URL and COOLIFY_API_TOKEN must be set'], {
+      adminEnabled: adminEditingEnabled(),
+    }));
   }
 
   const errors = [];
@@ -646,12 +1409,18 @@ app.get('/', async (req, res) => {
   const items = mergeItems(filtered, loadCustomLinks())
     .sort((a, b) => displayName(a).localeCompare(displayName(b)));
 
-  res.send(page(items, errors));
+  res.send(page(items, errors, { adminEnabled: adminEditingEnabled() }));
 });
 
 app.use((err, req, res, next) => {
+  if (err && err.type === 'entity.parse.failed') {
+    return res.status(400).json({ error: 'Invalid JSON body.' });
+  }
+  if (err && err.type === 'entity.too.large') {
+    return res.status(413).json({ error: 'Request body is too large.' });
+  }
   console.error('Unhandled error:', err);
-  res.status(500).send('Internal server error');
+  res.status(500).json({ error: 'Internal server error' });
 });
 
 if (require.main === module) {
@@ -662,20 +1431,28 @@ if (require.main === module) {
 
 module.exports = {
   app,
+  adminEditingEnabled,
   asArray,
   cardHtml,
   customIconHtml,
+  customLinkEntries,
   customLinksPath,
   dedupeItems,
   displayName,
   domainKey,
   extractDomains,
   fetchCoolifyJson,
+  handleCustomLinksSave,
+  isTruthyFlag,
   loadCustomLinks,
   logoSources,
   mergeItems,
   normalizeCoolifyItem,
+  normalizeLinkUpdate,
   normalizeUrl,
   page,
+  readCustomLinkEntries,
+  requireAdmin,
+  saveCustomLinkUpdates,
   statusInfo,
 };
